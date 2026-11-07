@@ -1,0 +1,5 @@
+# The exact upstream x264 the engine's encoder is built from: the stable branch at the
+# commit Ubuntu packages as libx264 0.165.3222. prepare.sh refuses to continue if the
+# clone does not land on this commit.
+X264_BRANCH=stable
+X264_COMMIT=b35605ace3ddf7c1a5d67a2eb553f034aef41d55

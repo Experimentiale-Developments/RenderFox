@@ -1,0 +1,5 @@
+# The engine is built on the machine that runs it, for its CPU: AVX2 and FMA where the CPU
+# has them (a VM needs a CPU type that passes them through). Built on an older CPU it falls
+# back to SSE2, and a binary copied to a CPU lacking what it was built for refuses to start.
+[build]
+rustflags = ["-C", "target-cpu=native"]

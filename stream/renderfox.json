@@ -1,0 +1,59 @@
+{
+  // Render Fox engine settings. setup.sh copies this to renderfox.json at the top of the
+  // checkout; relative paths count from that file's folder. docs/configuration.md explains
+  // every key.
+  "assets": "assets/client",
+  "port": 25590,
+  // Leave empty and pair instead (`renderfox pair`); a key here pins one server by hand.
+  "observerKey": "",
+  "pairing": {
+    "keyFile": "observer.pub",
+    "codeFile": "run/pairing.code"
+  },
+  "width": 1920,
+  "height": 1080,
+  "fps": 24,
+  "threads": 4,
+  "staticEvery": 7,
+  "aheadFrames": 4,
+  "encoder": {
+    "bitrateKbps": 10000,
+    "preset": "superfast",
+    "threads": 2
+  },
+  "replay": {
+    "enabled": true,
+    "store": "run/replay/region.bin",
+    "settleSeconds": 4,
+    "warmSeconds": 1.5,
+    "natureSeconds": 1800
+  },
+  "orbit": {
+    "center": [0, 77, 0],
+    "radius": 55,
+    "height": 22,
+    "lookHeight": 0,
+    "periodSeconds": 360,
+    "fov": 70
+  },
+  "overlay": {
+    "fonts": "fonts",
+    "nowPlaying": "run/nowplaying.txt",
+    "station": "RENDER FOX",
+    "invite": "Join the server to see yourself in the live stream",
+    "joinLabel": "JOIN US",
+    "address": "play.example.com"
+  },
+  "look": {
+    "saturation": 1.0,
+    "sunElevation": 36,
+    "sunAzimuth": 118,
+    "sunColor": [1.0, 0.86, 0.7],
+    "sunIntensity": 3.3,
+    "exposure": 0.95,
+    "fogStart": 140,
+    "fogEnd": 250,
+    "skyHorizon": [0.5, 0.66, 0.9],
+    "skyZenith": [0.1, 0.26, 0.75]
+  }
+}

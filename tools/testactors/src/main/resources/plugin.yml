@@ -1,0 +1,14 @@
+name: RenderFoxTestActors
+version: ${project.version}
+main: net.experimentiale.renderfox.testactors.TestActors
+api-version: '26.2'
+author: Experimentiale Developments
+description: TEST SERVERS ONLY. Mannequins that walk around spawn and a builder that edits blocks, for exercising Render Fox.
+commands:
+  actors:
+    description: Start or stop the Render Fox test actors.
+    usage: /actors <start|stop>
+    permission: renderfox.actors
+permissions:
+  renderfox.actors:
+    default: op

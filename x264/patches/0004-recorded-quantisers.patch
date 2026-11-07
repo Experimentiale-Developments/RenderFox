@@ -1,0 +1,35 @@
+--- a/x264.h
++++ b/x264.h
+@@ -841,6 +841,10 @@
+      *     Adaptive quantization must be enabled to use this feature.  Behavior if quant
+      *     offsets differ between encoding passes is undefined. */
+     float *quant_offsets;
++    /* With region.b_only, an offset given for a macroblock replaces adaptive quantization's
++     * there rather than adding to it, so a recoded macroblock can keep the quantiser it was
++     * first coded at; X264_QUANT_OFFSET_AQ leaves a macroblock to adaptive quantization. */
++#define X264_QUANT_OFFSET_AQ 1e9f
+     /* In: optional callback to free quant_offsets when used.
+      *     Useful if one wants to use a different quant_offset array for each frame. */
+     void (*quant_offsets_free)( void* );
+--- a/encoder/ratecontrol.c
++++ b/encoder/ratecontrol.c
+@@ -379,7 +379,9 @@
+             {
+                 float qp_adj;
+                 int mb_xy = mb_x + mb_y*h->mb.i_mb_stride;
+-                if( h->param.rc.i_aq_mode == X264_AQ_AUTOVARIANCE_BIASED )
++                if( h->param.region.b_only && quant_offsets && quant_offsets[mb_xy] != X264_QUANT_OFFSET_AQ )
++                    qp_adj = 0.f; /* recoding what was coded: the offset given is the whole of it */
++                else if( h->param.rc.i_aq_mode == X264_AQ_AUTOVARIANCE_BIASED )
+                 {
+                     qp_adj = frame->f_qp_offset[mb_xy];
+                     qp_adj = strength * (qp_adj - avg_adj) + bias_strength * (1.f - 14.f / (qp_adj * qp_adj));
+@@ -396,7 +398,7 @@
+                     uint32_t energy = ac_energy_mb( h, mb_x, mb_y, frame );
+                     qp_adj = strength * (x264_log2( X264_MAX(energy, 1) ) - (14.427f + 2*(BIT_DEPTH-8)));
+                 }
+-                if( quant_offsets )
++                if( quant_offsets && quant_offsets[mb_xy] != X264_QUANT_OFFSET_AQ )
+                     qp_adj += quant_offsets[mb_xy];
+                 frame->f_qp_offset[mb_xy] =
+                 frame->f_qp_offset_aq[mb_xy] = qp_adj;

@@ -1,0 +1,17 @@
+[Unit]
+Description=Render Fox stream watchdog: restarts an uplink systemd has given up on
+After=renderfox-relay.service
+Wants=renderfox-relay.service
+StartLimitIntervalSec=0
+
+[Service]
+# Root only to restart the uplinks; it reads the relay's local API and uplink.env.
+User=root
+Environment=RF_RELAY_HOME=@RF_HOME@/relay
+Environment=RF_RUN_DIR=@RF_HOME@/run
+ExecStart=/usr/bin/python3 @RF_HOME@/relay/watchdog.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

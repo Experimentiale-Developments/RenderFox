@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""renderfox: run the Render Fox stream on this machine.
+
+    renderfox status              what runs, what the stream feeds from and sends to
+    renderfox start | stop | restart
+    renderfox logs [encode|relay|uplink|backup|watchdog]
+    renderfox pair                the code and the command to pair a game server
+    renderfox unpair              forget the paired server and make a new code
+    renderfox youtube [--key K] [--no-backup]
+    renderfox twitch [--key K]
+    renderfox rtmp URL [--backup URL]
+    renderfox output              where the stream goes now
+
+Stream keys are asked for without echoing and kept in relay/uplink.env, readable by the
+stream's user only. setup.sh links this script to /usr/local/bin/renderfox.
+"""
+import argparse
+import getpass
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+RF = Path(os.environ.get("RF_HOME", Path(__file__).resolve().parent))
+CONFIG = Path(os.environ.get("RF_CONFIG", RF / "renderfox.json"))
+UPLINK_ENV = RF / "relay" / "uplink.env"
+UNITS = ["renderfox-relay", "renderfox-encode", "renderfox-uplink", "renderfox-uplink-backup", "renderfox-watchdog"]
+LOG_UNITS = {"encode": "renderfox-encode", "relay": "renderfox-relay", "uplink": "renderfox-uplink",
+             "backup": "renderfox-uplink-backup", "watchdog": "renderfox-watchdog"}
+RELAY_API = "http://127.0.0.1:9997/v3/paths/get/fm"
+
+YOUTUBE_PRIMARY = "rtmps://a.rtmps.youtube.com:443/live2/{key}"
+YOUTUBE_BACKUP = "rtmps://b.rtmps.youtube.com:443/live2?backup=1/{key}"
+TWITCH = "rtmps://ingest.global-contribute.live-video.net:443/app/{key}"
+TWITCH_MAX_KBPS = 6000
+
+
+def fail(message):
+    sys.exit(f"renderfox: {message}")
+
+
+def strip_comments(text):
+    """renderfox.json may carry // and /* */ comments, as the engine allows."""
+    return re.sub(r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*.*?\*/', lambda m: m.group(0) if m.group(0)[0] == '"' else " ", text, flags=re.S)
+
+
+def config():
+    try:
+        return json.loads(strip_comments(CONFIG.read_text()))
+    except FileNotFoundError:
+        fail(f"no {CONFIG}; run setup.sh first")
+    except json.JSONDecodeError as e:
+        fail(f"{CONFIG} is not valid JSON: {e}")
+
+
+def beside(path):
+    p = Path(path)
+    return p if p.is_absolute() else CONFIG.parent / p
+
+
+def pairing_files(cfg):
+    pairing = cfg.get("pairing", {})
+    return beside(pairing.get("keyFile", "observer.pub")), beside(pairing.get("codeFile", "run/pairing.code"))
+
+
+def systemctl(*args, check=True):
+    command = ["systemctl", *args]
+    if os.geteuid() != 0 and args[0] not in ("is-active", "is-enabled", "status"):
+        command.insert(0, "sudo")
+    return subprocess.run(command, check=check, capture_output=args[0] in ("is-active", "is-enabled"), text=True)
+
+
+def active(unit):
+    return systemctl("is-active", unit, check=False).stdout.strip()
+
+
+def enabled(unit):
+    return systemctl("is-enabled", unit, check=False).stdout.strip()
+
+
+def read_env():
+    values = {}
+    try:
+        for line in UPLINK_ENV.read_text().splitlines():
+            key, sep, value = line.strip().partition("=")
+            if sep and not key.startswith("#"):
+                values[key] = value.strip().strip('"\'')
+    except FileNotFoundError:
+        pass
+    return values
+
+
+def masked(url):
+    """The URL without the stream key, which is the secret part."""
+    if not url:
+        return "(none)"
+    head, _, key = url.rpartition("/")
+    return f"{head}/{key[:4]}..." if key else url
+
+
+def write_env(platform, primary, backup=""):
+    lines = [
+        f"# Where the stream goes. Written by `renderfox {platform}`; the URLs end in the stream key,",
+        "# so this file is readable by the stream's user only. Reset the key on the platform if it leaks.",
+        f"PLATFORM={platform}",
+        f'PRIMARY_INGEST_URL="{primary}"',
+        f'BACKUP_INGEST_URL="{backup}"',
+    ]
+    partial = UPLINK_ENV.with_suffix(".partial")
+    fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    if os.geteuid() == 0:
+        owner = RF.stat()
+        os.chown(partial, owner.st_uid, owner.st_gid)
+    partial.replace(UPLINK_ENV)
+    print(f"Saved to {UPLINK_ENV}: {masked(primary)}" + (f", backup {masked(backup)}" if backup else ""))
+    apply_output(bool(backup))
+
+
+def apply_output(with_backup):
+    """Enables the uplinks the new output needs and restarts the ones that were running."""
+    if enabled("renderfox-uplink") in ("", "not-found"):
+        print("The services are not installed yet (sudo ./install.sh); they pick this up when they start.")
+        return
+    systemctl("enable", "-q", "renderfox-uplink")
+    systemctl("enable" if with_backup else "disable", "-q", "renderfox-uplink-backup")
+    if not with_backup and active("renderfox-uplink-backup") == "active":
+        systemctl("stop", "renderfox-uplink-backup")
+    for unit in ["renderfox-uplink"] + (["renderfox-uplink-backup"] if with_backup else []):
+        if active("renderfox-encode") == "active":
+            systemctl("restart", unit)
+            print(f"Restarted {unit}.")
+
+
+def ask_key(given, where):
+    key = given or getpass.getpass(f"Stream key (from {where}; it is not shown as you type): ")
+    key = key.strip()
+    # A pasted URL instead of a key: keep the last path part, the key itself.
+    if key.startswith("rtmp"):
+        key = key.rstrip("/").rpartition("/")[2]
+    if not key or any(c.isspace() for c in key) or "/" in key:
+        fail("that does not look like a stream key")
+    return key
+
+
+def cmd_youtube(args):
+    key = ask_key(args.key, "YouTube Studio, Go live, Stream, Stream key")
+    if not re.fullmatch(r"[a-z0-9]{4}(-[a-z0-9]{4}){4}", key):
+        print("Note: YouTube keys usually look like abcd-efgh-ijkl-mnop-qrst; using it anyway.")
+    write_env("youtube", YOUTUBE_PRIMARY.format(key=key), "" if args.no_backup else YOUTUBE_BACKUP.format(key=key))
+    print("In YouTube Studio, turn on Auto-start for this stream key so the broadcast starts by itself,")
+    print("and share the channel's /live address: it always points at the current broadcast.")
+
+
+def cmd_twitch(args):
+    key = ask_key(args.key, "the Twitch dashboard, Settings, Stream, Primary Stream key")
+    write_env("twitch", TWITCH.format(key=key))
+    bitrate = config().get("encoder", {}).get("bitrateKbps", 10000)
+    if bitrate > TWITCH_MAX_KBPS:
+        print(f"Twitch takes at most {TWITCH_MAX_KBPS} kbit/s from most channels; set encoder.bitrateKbps to "
+              f"{TWITCH_MAX_KBPS} in {CONFIG} and run renderfox restart.")
+
+
+def cmd_rtmp(args):
+    for url in filter(None, [args.url, args.backup]):
+        if not re.match(r"rtmps?://", url):
+            fail(f"{url} is not an rtmp:// or rtmps:// URL")
+    write_env("rtmp", args.url, args.backup or "")
+
+
+def cmd_output(_):
+    env = read_env()
+    if not env.get("PRIMARY_INGEST_URL"):
+        print("No output yet: run renderfox youtube, renderfox twitch or renderfox rtmp URL.")
+        return
+    print(f"{env.get('PLATFORM', 'rtmp')}: {masked(env['PRIMARY_INGEST_URL'])}")
+    if env.get("BACKUP_INGEST_URL"):
+        print(f"backup: {masked(env['BACKUP_INGEST_URL'])}")
+
+
+def addresses():
+    """This machine's addresses a game server could dial, best guess first."""
+    found = []
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))  # no packet is sent; it only picks the outgoing interface
+            found.append(s.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["hostname", "-I"], capture_output=True, text=True).stdout.split()
+        found += [a for a in out if ":" not in a and a not in found]
+    except OSError:
+        pass
+    return found or ["<this machine>"]
+
+
+def paired_key(cfg):
+    key_file, _ = pairing_files(cfg)
+    if cfg.get("observerKey"):
+        return cfg["observerKey"], "observerKey in renderfox.json"
+    try:
+        return key_file.read_text().strip(), str(key_file)
+    except FileNotFoundError:
+        return None, None
+
+
+def cmd_pair(_):
+    cfg = config()
+    key, source = paired_key(cfg)
+    if key:
+        print(f"Already paired with the server whose key is {key} ({source}).")
+        print("To pair another server, run renderfox unpair first.")
+        return
+    _, code_file = pairing_files(cfg)
+    if not code_file.exists():
+        if active("renderfox-encode") != "active":
+            fail("the engine is not running, so it has no code yet: renderfox start")
+        for _ in range(20):
+            if code_file.exists():
+                break
+            time.sleep(0.5)
+        else:
+            fail(f"the engine is running but wrote no code to {code_file}; see renderfox logs")
+    code = code_file.read_text().strip()
+    port = cfg.get("port", 25590)
+    hosts = addresses()
+    print(f"Pairing code: {code}\n")
+    print("On the Minecraft server, as an operator or in the console, run:\n")
+    print(f"    /renderfox pair {hosts[0]}:{port} {code}\n")
+    if len(hosts) > 1:
+        print("If the server reaches this machine by another address, use that instead: " + ", ".join(hosts[1:]))
+    print(f"The server must be able to reach TCP port {port} here. The code works once; five wrong tries replace it.")
+
+
+def cmd_unpair(args):
+    cfg = config()
+    key_file, code_file = pairing_files(cfg)
+    if cfg.get("observerKey"):
+        fail(f"the server is pinned by observerKey in {CONFIG}; empty it, then run renderfox unpair")
+    if not key_file.exists():
+        print("Not paired with any server.")
+        return
+    if not args.yes and input(f"Forget the server whose key is {key_file.read_text().strip()}? It stops feeding the stream. [y/N] ").lower() != "y":
+        return
+    key_file.unlink()
+    code_file.unlink(missing_ok=True)
+    if active("renderfox-encode") == "active":
+        systemctl("restart", "renderfox-encode")
+        print("Restarted the encoder, which now waits for a new server.\n")
+        cmd_pair(args)
+    else:
+        print("Forgotten. Start the stream (renderfox start) and run renderfox pair for a new code.")
+
+
+def relay_state():
+    try:
+        with urllib.request.urlopen(RELAY_API, timeout=2) as r:
+            return json.load(r)
+    except (OSError, ValueError):
+        return None
+
+
+def cmd_status(_):
+    cfg = config()
+    print("Services:")
+    for unit in UNITS:
+        print(f"  {unit:<26} {active(unit):<10} {enabled(unit)}")
+    key, source = paired_key(cfg)
+    if key:
+        print(f"Game server: paired, key {key}")
+    else:
+        _, code_file = pairing_files(cfg)
+        print("Game server: not paired" + (f", code {code_file.read_text().strip()} (renderfox pair)" if code_file.exists() else ""))
+    env = read_env()
+    print(f"Output: {env.get('PLATFORM', 'none')} {masked(env.get('PRIMARY_INGEST_URL', ''))}"
+          + (" with backup" if env.get("BACKUP_INGEST_URL") else ""))
+    relay = relay_state()
+    if relay is None:
+        print("Relay: not answering")
+    else:
+        print(f"Relay: {'receiving' if relay.get('ready') else 'waiting for the encoder'}, "
+              f"{len(relay.get('readers', []))} uplink(s) reading, {relay.get('bytesReceived', 0) / 1e9:.2f} GB in")
+    playing = beside(cfg.get("overlay", {}).get("nowPlaying", "run/nowplaying.txt"))
+    if playing.exists():
+        print(f"Now playing: {playing.read_text().splitlines()[0] if playing.read_text() else '(silence)'}")
+
+
+def cmd_service(args):
+    env = read_env()
+    units = [u for u in UNITS if u != "renderfox-uplink-backup" or env.get("BACKUP_INGEST_URL")]
+    if args.command == "start" and not env.get("PRIMARY_INGEST_URL"):
+        print("Note: no output is set, so nothing leaves this machine yet (renderfox youtube).")
+    if args.command == "stop":
+        units.reverse()
+    systemctl(args.command, *units)
+    print(f"{args.command}: {' '.join(units)}")
+
+
+def cmd_logs(args):
+    os.execvp("journalctl", ["journalctl", "-f", "-n", "50", "-u", LOG_UNITS[args.unit]])
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="renderfox", description="Run the Render Fox stream on this machine.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("status", help="what runs, and where the stream comes from and goes").set_defaults(run=cmd_status)
+    for name in ("start", "stop", "restart"):
+        sub.add_parser(name, help=f"{name} the stream's services").set_defaults(run=cmd_service)
+    logs = sub.add_parser("logs", help="follow a service's log")
+    logs.add_argument("unit", nargs="?", default="encode", choices=sorted(LOG_UNITS))
+    logs.set_defaults(run=cmd_logs)
+    sub.add_parser("pair", help="show the code that pairs a game server").set_defaults(run=cmd_pair)
+    unpair = sub.add_parser("unpair", help="forget the paired game server")
+    unpair.add_argument("--yes", action="store_true", help="do not ask")
+    unpair.set_defaults(run=cmd_unpair)
+    youtube = sub.add_parser("youtube", help="stream to YouTube")
+    youtube.add_argument("--key", help="the stream key; asked for when left out")
+    youtube.add_argument("--no-backup", action="store_true", help="send to YouTube's primary ingest only")
+    youtube.set_defaults(run=cmd_youtube)
+    twitch = sub.add_parser("twitch", help="stream to Twitch")
+    twitch.add_argument("--key", help="the stream key; asked for when left out")
+    twitch.set_defaults(run=cmd_twitch)
+    rtmp = sub.add_parser("rtmp", help="stream to any RTMP or RTMPS ingest")
+    rtmp.add_argument("url", help="the full URL, stream key included")
+    rtmp.add_argument("--backup", help="a second ingest sent the same stream at the same time")
+    rtmp.set_defaults(run=cmd_rtmp)
+    sub.add_parser("output", help="where the stream goes now").set_defaults(run=cmd_output)
+    args = parser.parse_args()
+    try:
+        args.run(args)
+    except subprocess.CalledProcessError as e:
+        fail(f"{' '.join(e.cmd)} failed")
+    except KeyboardInterrupt:
+        print()
+
+
+if __name__ == "__main__":
+    main()

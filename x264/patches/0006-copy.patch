@@ -1,0 +1,546 @@
+--- a/x264.h
++++ b/x264.h
+@@ -941,8 +941,47 @@
+     /* In, with region.b_only: the zones to encode, bit z for zone z; 0 means the region
+      * alone. Change it only on an IDR: a zone not encoded has nothing to predict from. */
+     int     i_region_zones;
++    /* In, with region.b_only: macroblocks to write as they were coded before rather than
++     * encode afresh. copy_index has an entry per macroblock of the frame, -1 or an index
++     * into copy_pool. Both must stay as they are until the picture comes out. */
++    int32_t *copy_index;
++    struct x264_copy_mb_t *copy_pool;
+ } x264_picture_t;
+ 
++/* A macroblock as it was coded before (by an encoder with the same parameters), to be
++ * written again as it was: its type, prediction, quantiser and levels, and the vectors
++ * its decoder found. Written only where the slice allows it as given: a skip or direct
++ * macroblock whose vectors would come out otherwise here is written with the vectors
++ * themselves, or, where it cannot be, encoded afresh. */
++#define X264_COPY_I4x4     0
++#define X264_COPY_I8x8     1
++#define X264_COPY_I16x16   2
++#define X264_COPY_P16x16   3
++#define X264_COPY_P_SKIP   4
++#define X264_COPY_B_DIRECT 5
++#define X264_COPY_B_SKIP   6
++#define X264_COPY_B16x16   7   /* lists from ref[] */
++typedef struct x264_copy_mb_t
++{
++    uint8_t i_type;
++    uint8_t b_transform_8x8;
++    uint8_t i_qp;
++    uint8_t i_cbp_luma;           /* bit per 8x8 block; I16x16: 0 or 15 */
++    uint8_t i_cbp_chroma;         /* 0, 1 (DC) or 2 (DC and AC) */
++    uint8_t i_intra16x16_mode;    /* as coded: 0 V, 1 H, 2 DC, 3 plane */
++    uint8_t i_chroma_mode;        /* as coded: 0 DC, 1 H, 2 V, 3 plane */
++    uint8_t intra4x4_mode[16];    /* as coded, luma4x4BlkIdx order; I8x8: each block's four */
++    int8_t  ref[2][4];            /* per 8x8 block (raster): 0 where the list predicts it, -1 */
++    int16_t mv[2][4][2];          /* per 8x8 block and list, quarter pixels */
++    /* Levels in scan order, as coded: 4x4 blocks (luma4x4BlkIdx order; I16x16 AC from
++     * [1]) or, with the 8x8 transform, 8x8 blocks, sharing the space; the I16x16 DC;
++     * chroma DC (Cb, Cr) and chroma AC (Cb 0..3, Cr 0..3, from [1]). */
++    int16_t luma[256];
++    int16_t luma_dc[16];
++    int16_t chroma_dc[2][4];
++    int16_t chroma_ac[8][16];
++} x264_copy_mb_t;
++
+ /* x264_picture_init:
+  *  initialize an x264_picture_t.  Needs to be done if the calling application
+  *  allocates its own x264_picture_t as opposed to using x264_picture_alloc. */
+--- a/common/common.h
++++ b/common/common.h
+@@ -518,6 +518,8 @@
+ 
+         /* Allowed qpel MV range to stay within the picture + emulated edge pixels */
+         int     mv_min[2];
++        int     i_mv_row; /* the row the vertical limits below were worked out for */
++        int     b_copying; /* writing a macroblock as coded before (its vectors kept to the zones then) */
+         int     mv_max[2];
+         int     mv_miny_row[3]; /* 0 == top progressive, 1 == bot progressive, 2 == interlaced */
+         int     mv_maxy_row[3];
+--- a/common/frame.h
++++ b/common/frame.h
+@@ -174,6 +174,8 @@
+     void *opaque;
+     int     i_idr_pic_id;
+     int     i_region_zones;
++    int32_t *copy_index;
++    struct x264_copy_mb_t *copy_pool;
+ 
+     /* user frame properties */
+     uint8_t *mb_info;
+--- a/common/frame.c
++++ b/common/frame.c
+@@ -406,6 +406,8 @@
+     dst->opaque     = src->opaque;
+     dst->i_idr_pic_id = src->i_idr_pic_id;
+     dst->i_region_zones = src->i_region_zones ? src->i_region_zones : 1;
++    dst->copy_index = h->param.region.b_only ? src->copy_index : NULL;
++    dst->copy_pool  = h->param.region.b_only ? src->copy_pool : NULL;
+     dst->mb_info    = h->param.analyse.b_mb_info ? src->prop.mb_info : NULL;
+     dst->mb_info_free = h->param.analyse.b_mb_info ? src->prop.mb_info_free : NULL;
+ 
+--- a/common/mvpred.c
++++ b/common/mvpred.c
+@@ -467,7 +467,7 @@
+         b_available = mb_predict_mv_direct16x16_temporal( h );
+ 
+     /* Direct vectors are derived rather than searched, so nothing kept them out of the region. */
+-    if( b_available && ZONES_ACTIVE( &h->param ) )
++    if( b_available && ZONES_ACTIVE( &h->param ) && !h->mb.b_copying )
+         for( int i = 0; i < 16 && b_available; i++ )
+             for( int l = 0; l < 2; l++ )
+                 if( h->mb.cache.ref[l][x264_scan8[i]] >= 0 && !x264_mb_region_mv_ok( h, h->mb.cache.mv[l][x264_scan8[i]] ) )
+--- a/encoder/analyse.c
++++ b/encoder/analyse.c
+@@ -446,8 +446,11 @@
+         }
+         h->mb.mv_limit_fpel[0][0] = (h->mb.mv_min_spel[0]>>2) + i_fpel_border;
+         h->mb.mv_limit_fpel[1][0] = (h->mb.mv_max_spel[0]>>2) - i_fpel_border;
+-        if( h->mb.i_mb_x == 0 && !(h->mb.i_mb_y & PARAM_INTERLACED) )
++        /* Once a row, at its first macroblock analysed (the first may have been skipped,
++         * outside the region's zones, or written as coded before). */
++        if( h->mb.i_mv_row != h->mb.i_mb_y && !(h->mb.i_mb_y & PARAM_INTERLACED) )
+         {
++            h->mb.i_mv_row = h->mb.i_mb_y;
+             int mb_y = h->mb.i_mb_y >> SLICE_MBAFF;
+             int thread_mvy_range = i_fmv_range;
+ 
+--- a/encoder/encoder.c
++++ b/encoder/encoder.c
+@@ -2275,7 +2275,8 @@
+             h->sh.weight[i_ref][i].weightfn = NULL;
+ 
+ 
+-    if( h->sh.i_type != SLICE_TYPE_P || h->param.analyse.i_weighted_pred <= 0 )
++    /* Macroblocks written as coded before predict as they did then: unweighted. */
++    if( h->sh.i_type != SLICE_TYPE_P || h->param.analyse.i_weighted_pred <= 0 || h->fenc->copy_index )
+         return;
+ 
+     int i_padv = PADV << PARAM_INTERLACED;
+@@ -2852,6 +2853,7 @@
+ 
+     /* Set the QP equal to the first QP in the slice for more accurate CABAC initialization. */
+     h->mb.i_mb_xy = h->sh.i_first_mb;
++    h->mb.i_mv_row = -1;
+     h->sh.i_qp = x264_ratecontrol_mb_qp( h );
+     h->sh.i_qp = SPEC_QP( h->sh.i_qp );
+     h->sh.i_qp_delta = h->sh.i_qp - h->pps->i_pic_init_qp;
+@@ -2939,11 +2941,16 @@
+         else
+             x264_macroblock_cache_load_progressive( h, i_mb_x, i_mb_y );
+ 
+-        x264_macroblock_analyse( h );
++        /* A macroblock given as coded before is written as it was, if it can be. */
++        int copied = h->fenc->copy_index && h->fenc->copy_index[mb_xy] >= 0
++                     && x264_macroblock_copy( h, &h->fenc->copy_pool[h->fenc->copy_index[mb_xy]] );
++        if( !copied )
++            x264_macroblock_analyse( h );
+ 
+         /* encode this macroblock -> be careful it can change the mb type to P_SKIP if needed */
+ reencode:
+-        x264_macroblock_encode( h );
++        if( !copied )
++            x264_macroblock_encode( h );
+ 
+         if( h->param.b_cabac )
+         {
+--- a/encoder/macroblock.h
++++ b/encoder/macroblock.h
+@@ -51,6 +51,8 @@
+ 
+ #define x264_macroblock_encode x264_template(macroblock_encode)
+ void x264_macroblock_encode      ( x264_t *h );
++#define x264_macroblock_copy x264_template(macroblock_copy)
++int  x264_macroblock_copy        ( x264_t *h, const x264_copy_mb_t *c );
+ #define x264_macroblock_write_cabac x264_template(macroblock_write_cabac)
+ void x264_macroblock_write_cabac ( x264_t *h, x264_cabac_t *cb );
+ #define x264_macroblock_write_cavlc x264_template(macroblock_write_cavlc)
+--- a/encoder/macroblock.c
++++ b/encoder/macroblock.c
+@@ -1423,3 +1423,384 @@
+     else
+         macroblock_encode_p4x4_internal( h, i8, 1 );
+ }
++
++/* Writing a macroblock as it was coded before (x264_copy_mb_t): its prediction is formed
++ * here as a decoder forms it, from this encoder's reconstruction, and its levels are
++ * added back the way a decoder adds them, so what this encoder holds is what a decoder
++ * of its slices holds. */
++
++/* A DC prediction mode adjusted to the neighbours there are, as analysis picks it. */
++static int copy_dc_mode( int mode, int dc, unsigned nb, int dc_left, int dc_top, int dc_128 )
++{
++    if( mode != dc )
++        return mode;
++    if( (nb & (MB_LEFT|MB_TOP)) == (MB_LEFT|MB_TOP) )
++        return dc;
++    if( nb & MB_LEFT )
++        return dc_left;
++    if( nb & MB_TOP )
++        return dc_top;
++    return dc_128;
++}
++
++static void copy_unscan4( dctcoef dct[16], const int16_t level[16], int from )
++{
++    memset( dct, 0, 16 * sizeof(dctcoef) );
++    for( int i = from; i < 16; i++ )
++        dct[x264_zigzag_scan4[0][i]] = level[i];
++}
++
++static int copy_nz( const int16_t *level, int n )
++{
++    for( int i = 0; i < n; i++ )
++        if( level[i] )
++            return 1;
++    return 0;
++}
++
++/* The residual of one luma 4x4 block (inter or I4x4) onto its prediction. */
++static void copy_add4x4( x264_t *h, const x264_copy_mb_t *c, int i, int cat, int qp )
++{
++    ALIGNED_ARRAY_64( dctcoef, dct,[16] );
++    const int16_t *level = &c->luma[16*i];
++    int nz = (c->i_cbp_luma >> (i>>2)) & 1 && copy_nz( level, 16 );
++    h->mb.cache.non_zero_count[x264_scan8[i]] = nz;
++    if( !nz )
++    {
++        memset( h->dct.luma4x4[i], 0, 16 * sizeof(dctcoef) );
++        return;
++    }
++    for( int k = 0; k < 16; k++ )
++        h->dct.luma4x4[i][k] = level[k];
++    copy_unscan4( dct, level, 0 );
++    h->quantf.dequant_4x4( dct, h->dequant4_mf[cat], qp );
++    h->dctf.add4x4_idct( &h->mb.pic.p_fdec[0][block_idx_xy_fdec[i]], dct );
++}
++
++static void copy_add8x8( x264_t *h, const x264_copy_mb_t *c, int i, int cat, int qp )
++{
++    ALIGNED_ARRAY_64( dctcoef, dct,[64] );
++    const int16_t *level = &c->luma[64*i];
++    int nz = (c->i_cbp_luma >> i) & 1 && copy_nz( level, 64 );
++    STORE_8x8_NNZ( 0, i, nz );
++    if( !nz )
++    {
++        memset( h->dct.luma8x8[i], 0, 64 * sizeof(dctcoef) );
++        return;
++    }
++    memset( dct, 0, sizeof(dct) );
++    for( int k = 0; k < 64; k++ )
++    {
++        h->dct.luma8x8[i][k] = level[k];
++        dct[x264_zigzag_scan8[0][k]] = level[k];
++    }
++    h->quantf.dequant_8x8( dct, h->dequant8_mf[cat], qp );
++    h->dctf.add8x8_idct8( &h->mb.pic.p_fdec[0][8*(i&1) + 8*(i>>1)*FDEC_STRIDE], dct );
++}
++
++static void copy_chroma( x264_t *h, const x264_copy_mb_t *c, int b_inter )
++{
++    int qp = h->mb.i_chroma_qp;
++    int (*dequant_mf)[16] = h->dequant4_mf[CQM_4IC + b_inter];
++    for( int ch = 0; ch < 2; ch++ )
++    {
++        ALIGNED_ARRAY_64( dctcoef, dct4x4,[4],[16] );
++        ALIGNED_ARRAY_16( dctcoef, dct_dc,[4] );
++        int nz_dc = c->i_cbp_chroma && copy_nz( c->chroma_dc[ch], 4 );
++        h->mb.cache.non_zero_count[x264_scan8[CHROMA_DC+ch]] = nz_dc;
++        for( int k = 0; k < 4; k++ )
++            h->dct.chroma_dc[ch][k] = nz_dc ? c->chroma_dc[ch][k] : 0;
++        int nz_ac = 0;
++        for( int i = 0; i < 4; i++ )
++        {
++            int idx = 16 + 16*ch + i;
++            const int16_t *level = c->chroma_ac[4*ch + i];
++            int nz = c->i_cbp_chroma == 2 && copy_nz( level + 1, 15 );
++            h->mb.cache.non_zero_count[x264_scan8[idx]] = nz;
++            nz_ac |= nz;
++            for( int k = 0; k < 16; k++ )
++                h->dct.luma4x4[idx][k] = nz && k ? level[k] : 0;
++            copy_unscan4( dct4x4[i], level, 1 );
++            if( nz )
++                h->quantf.dequant_4x4( dct4x4[i], dequant_mf, qp );
++            else
++                memset( dct4x4[i], 0, sizeof(dct4x4[i]) );
++        }
++        if( !nz_dc && !nz_ac )
++            continue;
++        if( nz_dc )
++        {
++            /* The 2x2 DC scan is x264's dct[x*2+y]. */
++            dct_dc[0] = c->chroma_dc[ch][0];
++            dct_dc[2] = c->chroma_dc[ch][1];
++            dct_dc[1] = c->chroma_dc[ch][2];
++            dct_dc[3] = c->chroma_dc[ch][3];
++            idct_dequant_2x2_dc( dct_dc, dct4x4, dequant_mf, qp );
++        }
++        h->dctf.add8x8_idct( h->mb.pic.p_fdec[1+ch], dct4x4 );
++    }
++}
++
++static void copy_intra_luma( x264_t *h, const x264_copy_mb_t *c )
++{
++    int qp = h->mb.i_qp;
++    if( h->mb.i_type == I_4x4 )
++    {
++        for( int i = 0; i < 16; i++ )
++        {
++            pixel *p_dst = &h->mb.pic.p_fdec[0][block_idx_xy_fdec[i]];
++            int mode = h->mb.cache.intra4x4_pred_mode[x264_scan8[i]];
++            if( (h->mb.i_neighbour4[i] & (MB_TOPRIGHT|MB_TOP)) == MB_TOP )
++                /* emulate missing topright samples */
++                MPIXEL_X4( &p_dst[4-FDEC_STRIDE] ) = PIXEL_SPLAT_X4( p_dst[3-FDEC_STRIDE] );
++            h->predict_4x4[mode]( p_dst );
++            copy_add4x4( h, c, i, CQM_4IY, qp );
++        }
++    }
++    else if( h->mb.i_type == I_8x8 )
++    {
++        ALIGNED_ARRAY_32( pixel, edge,[36] );
++        for( int i = 0; i < 4; i++ )
++        {
++            pixel *p_dst = &h->mb.pic.p_fdec[0][8*(i&1) + 8*(i>>1)*FDEC_STRIDE];
++            int mode = h->mb.cache.intra4x4_pred_mode[x264_scan8[4*i]];
++            h->predict_8x8_filter( p_dst, edge, h->mb.i_neighbour8[i], x264_pred_i4x4_neighbors[mode] );
++            h->predict_8x8[mode]( p_dst, edge );
++            copy_add8x8( h, c, i, CQM_8IY, qp );
++        }
++    }
++    else
++    {
++        ALIGNED_ARRAY_64( dctcoef, dct4x4,[16],[16] );
++        ALIGNED_ARRAY_64( dctcoef, dct_dc4x4,[16] );
++        pixel *p_dst = h->mb.pic.p_fdec[0];
++        h->predict_16x16[h->mb.i_intra16x16_pred_mode]( p_dst );
++        int any = 0;
++        for( int i = 0; i < 16; i++ )
++        {
++            const int16_t *level = &c->luma[16*i];
++            int nz = c->i_cbp_luma && copy_nz( level + 1, 15 );
++            h->mb.cache.non_zero_count[x264_scan8[i]] = nz;
++            for( int k = 0; k < 16; k++ )
++                h->dct.luma4x4[i][k] = nz && k ? level[k] : 0;
++            copy_unscan4( dct4x4[i], level, 1 );
++            if( nz )
++                h->quantf.dequant_4x4( dct4x4[i], h->dequant4_mf[CQM_4IY], qp );
++            else
++                memset( dct4x4[i], 0, sizeof(dct4x4[i]) );
++            any |= nz;
++        }
++        int nz_dc = copy_nz( c->luma_dc, 16 );
++        h->mb.cache.non_zero_count[x264_scan8[LUMA_DC]] = nz_dc;
++        for( int k = 0; k < 16; k++ )
++            h->dct.luma16x16_dc[0][k] = c->luma_dc[k];
++        if( nz_dc )
++        {
++            copy_unscan4( dct_dc4x4, c->luma_dc, 0 );
++            h->dctf.idct4x4dc( dct_dc4x4 );
++            h->quantf.dequant_4x4_dc( dct_dc4x4, h->dequant4_mf[CQM_4IY], qp );
++            for( int i = 0; i < 16; i++ )
++                dct4x4[i][0] = dct_dc4x4[block_idx_xy_1d[i]];
++            any = 1;
++        }
++        if( any )
++            h->dctf.add16x16_idct( p_dst, dct4x4 );
++    }
++}
++
++int x264_macroblock_copy( x264_t *h, const x264_copy_mb_t *c )
++{
++    int type = c->i_type;
++    int slice = h->sh.i_type;
++    int qp = c->i_qp;
++    if( qp > QP_MAX_SPEC || c->i_cbp_luma > 15 || c->i_cbp_chroma > 2 )
++        return 0;
++    int b_intra = type <= X264_COPY_I16x16;
++    if( !b_intra && (slice == SLICE_TYPE_I || h->mb.pic.i_fref[0] < 1
++                     || ((type == X264_COPY_P16x16 || type == X264_COPY_P_SKIP) != (slice == SLICE_TYPE_P))) )
++        return 0;
++    /* Recorded vectors, per 8x8 block: the same in all four where the type needs one. */
++    int lists = 0;
++    if( !b_intra )
++    {
++        for( int l = 0; l < 2; l++ )
++            if( c->ref[l][0] == 0 )
++                lists |= 1 << l;
++        for( int i = 0; i < 4; i++ )
++            for( int l = 0; l < 2; l++ )
++                if( c->ref[l][i] != c->ref[l][0] || (c->ref[l][0] == 0 && M32( c->mv[l][i] ) != M32( c->mv[l][0] )) )
++                    lists = -1;
++        if( lists == 0 && type != X264_COPY_B_DIRECT && type != X264_COPY_B_SKIP )
++            return 0;
++        for( int l = 0; l < 2; l++ )
++            for( int i = 0; i < 4; i++ )
++                if( c->ref[l][i] != 0 && c->ref[l][i] != -1 )
++                    return 0;
++    }
++
++    int mb_type, partition = D_16x16;
++    if( type == X264_COPY_P_SKIP || type == X264_COPY_P16x16 )
++    {
++        if( lists != 1 )
++            return 0;
++        mb_type = P_L0;
++        if( type == X264_COPY_P_SKIP )
++        {
++            ALIGNED_4( int16_t mvp[2] );
++            x264_mb_predict_mv_pskip( h, mvp );
++            if( M32( mvp ) == M32( c->mv[0][0] ) && c->i_cbp_luma == 0 && c->i_cbp_chroma == 0 )
++                mb_type = P_SKIP;
++            else if( c->i_cbp_luma || c->i_cbp_chroma )
++                return 0;
++        }
++    }
++    else if( type == X264_COPY_B_DIRECT || type == X264_COPY_B_SKIP )
++    {
++        h->mb.b_copying = 1;
++        int same = x264_mb_predict_mv_direct16x16( h, NULL );
++        h->mb.b_copying = 0;
++        for( int i = 0; i < 4 && same; i++ )
++            for( int l = 0; l < 2; l++ )
++                if( h->mb.cache.direct_ref[l][i] != c->ref[l][i]
++                    || (c->ref[l][i] == 0 && M32( h->mb.cache.direct_mv[l][i] ) != M32( c->mv[l][i] )) )
++                    same = 0;
++        if( same )
++        {
++            mb_type = type == X264_COPY_B_SKIP ? B_SKIP : B_DIRECT;
++            partition = h->mb.cache.direct_partition;
++        }
++        else if( lists > 0 )
++            /* What it was derived to before, written out: one vector for the lot. */
++            mb_type = lists == 1 ? B_L0_L0 : lists == 2 ? B_L1_L1 : B_BI_BI;
++        else
++            return 0;
++        if( mb_type == B_SKIP && (c->i_cbp_luma || c->i_cbp_chroma) )
++            return 0;
++    }
++    else if( type == X264_COPY_B16x16 )
++    {
++        if( lists <= 0 || slice != SLICE_TYPE_B )
++            return 0;
++        mb_type = lists == 1 ? B_L0_L0 : lists == 2 ? B_L1_L1 : B_BI_BI;
++    }
++    else if( type == X264_COPY_I4x4 )
++        mb_type = c->b_transform_8x8 ? -1 : I_4x4;
++    else if( type == X264_COPY_I8x8 )
++        mb_type = c->b_transform_8x8 && h->pps->b_transform_8x8_mode ? I_8x8 : -1;
++    else if( type == X264_COPY_I16x16 )
++        mb_type = I_16x16;
++    else
++        return 0;
++    if( mb_type < 0 )
++        return 0;
++    if( !b_intra )
++    {
++        /* Vectors within what motion compensation here reads unclipped, as analysis keeps
++         * to (24 pixels past the frame's edge). */
++        int lo[2] = { 4*( -16*h->mb.i_mb_x - 24 ), 4*( -16*h->mb.i_mb_y - 24 ) };
++        int hi[2] = { 4*( 16*( h->mb.i_mb_width - h->mb.i_mb_x - 1 ) + 24 ), 4*( 16*( h->mb.i_mb_height - h->mb.i_mb_y - 1 ) + 24 ) };
++        for( int l = 0; l < 2; l++ )
++            for( int i = 0; i < 4; i++ )
++            {
++                int ref = mb_type == B_SKIP || mb_type == B_DIRECT ? h->mb.cache.direct_ref[l][i] : c->ref[l][i];
++                const int16_t *mv = mb_type == B_SKIP || mb_type == B_DIRECT ? h->mb.cache.direct_mv[l][i]
++                                  : mb_type == P_SKIP ? c->mv[0][0] : c->mv[l][i];
++                if( ref >= 0 && (mv[0] < lo[0] || mv[0] > hi[0] || mv[1] < lo[1] || mv[1] > hi[1]) )
++                    return 0;
++            }
++        h->mb.mv_min[0] = lo[0];
++        h->mb.mv_max[0] = hi[0];
++        h->mb.mv_min[1] = lo[1];
++        h->mb.mv_max[1] = hi[1];
++    }
++    if( c->b_transform_8x8 && !b_intra && (!h->pps->b_transform_8x8_mode || !c->i_cbp_luma
++        || (mb_type == B_DIRECT && !h->sps->b_direct8x8_inference)) )
++        return 0;
++
++    /* From here on the macroblock is written as given. */
++    h->mb.i_type = mb_type;
++    h->mb.i_partition = partition;
++    h->mb.i_qp = qp;
++    h->mb.i_chroma_qp = h->chroma_qp_table[qp];
++    h->mb.b_transform_8x8 = c->b_transform_8x8 && (mb_type == I_8x8 || (!b_intra && c->i_cbp_luma));
++    h->mb.i_cbp_luma = c->i_cbp_luma;
++    h->mb.i_cbp_chroma = c->i_cbp_chroma;
++    h->mb.i_skip_intra = 0;
++    h->mb.b_skip_mc = 1;
++    for( int i = 0; i < 4; i++ )
++        h->mb.i_sub_partition[i] = D_L0_8x8;
++    M32( &h->mb.cache.non_zero_count[x264_scan8[0]+0*8] ) = 0;
++    M32( &h->mb.cache.non_zero_count[x264_scan8[0]+1*8] ) = 0;
++    M32( &h->mb.cache.non_zero_count[x264_scan8[0]+2*8] ) = 0;
++    M32( &h->mb.cache.non_zero_count[x264_scan8[0]+3*8] ) = 0;
++    h->mb.cache.non_zero_count[x264_scan8[LUMA_DC]] = 0;
++
++    if( b_intra )
++    {
++        if( mb_type == I_4x4 )
++            for( int i = 0; i < 16; i++ )
++                h->mb.cache.intra4x4_pred_mode[x264_scan8[i]] =
++                    copy_dc_mode( c->intra4x4_mode[i], I_PRED_4x4_DC, h->mb.i_neighbour4[i], I_PRED_4x4_DC_LEFT, I_PRED_4x4_DC_TOP, I_PRED_4x4_DC_128 );
++        else if( mb_type == I_8x8 )
++            for( int i = 0; i < 4; i++ )
++                x264_macroblock_cache_intra8x8_pred( h, 2*(i&1), 2*(i>>1),
++                    copy_dc_mode( c->intra4x4_mode[4*i], I_PRED_8x8_DC, h->mb.i_neighbour8[i], I_PRED_8x8_DC_LEFT, I_PRED_8x8_DC_TOP, I_PRED_8x8_DC_128 ) );
++        else
++            h->mb.i_intra16x16_pred_mode = copy_dc_mode( c->i_intra16x16_mode, I_PRED_16x16_DC, h->mb.i_neighbour_intra,
++                                                         I_PRED_16x16_DC_LEFT, I_PRED_16x16_DC_TOP, I_PRED_16x16_DC_128 );
++        h->mb.i_chroma_pred_mode = copy_dc_mode( c->i_chroma_mode, I_PRED_CHROMA_DC, h->mb.i_neighbour_intra,
++                                                 I_PRED_CHROMA_DC_LEFT, I_PRED_CHROMA_DC_TOP, I_PRED_CHROMA_DC_128 );
++        copy_intra_luma( h, c );
++        h->predict_chroma[h->mb.i_chroma_pred_mode]( h->mb.pic.p_fdec[1] );
++        h->predict_chroma[h->mb.i_chroma_pred_mode]( h->mb.pic.p_fdec[2] );
++        copy_chroma( h, c, 0 );
++    }
++    else
++    {
++        if( mb_type == B_SKIP || mb_type == B_DIRECT )
++        {
++            for( int i = 0; i < 4; i++ )
++            {
++                int x = 2*(i&1), y = i&2;
++                x264_macroblock_cache_ref( h, x, y, 2, 2, 0, h->mb.cache.direct_ref[0][i] );
++                x264_macroblock_cache_ref( h, x, y, 2, 2, 1, h->mb.cache.direct_ref[1][i] );
++                x264_macroblock_cache_mv_ptr( h, x, y, 2, 2, 0, h->mb.cache.direct_mv[0][i] );
++                x264_macroblock_cache_mv_ptr( h, x, y, 2, 2, 1, h->mb.cache.direct_mv[1][i] );
++                h->mb.i_sub_partition[i] = D_DIRECT_8x8;
++            }
++        }
++        else
++        {
++            for( int l = 0; l <= (slice == SLICE_TYPE_B); l++ )
++            {
++                if( (lists >> l) & 1 )
++                {
++                    x264_macroblock_cache_ref( h, 0, 0, 4, 4, l, 0 );
++                    x264_macroblock_cache_mv_ptr( h, 0, 0, 4, 4, l, c->mv[l][0] );
++                }
++                else
++                {
++                    x264_macroblock_cache_ref( h, 0, 0, 4, 4, l, -1 );
++                    x264_macroblock_cache_mv( h, 0, 0, 4, 4, l, 0 );
++                    x264_macroblock_cache_mvd( h, 0, 0, 4, 4, l, 0 );
++                }
++            }
++        }
++        x264_mb_mc( h );
++        if( h->mb.b_transform_8x8 )
++            for( int i = 0; i < 4; i++ )
++                copy_add8x8( h, c, i, CQM_8PY, qp );
++        else
++            for( int i = 0; i < 16; i++ )
++                copy_add4x4( h, c, i, CQM_4PY, qp );
++        copy_chroma( h, c, 1 );
++    }
++
++    int cbp = h->mb.i_cbp_chroma << 4 | h->mb.i_cbp_luma;
++    if( h->param.b_cabac )
++        cbp |= h->mb.cache.non_zero_count[x264_scan8[LUMA_DC    ]] << 8
++            |  h->mb.cache.non_zero_count[x264_scan8[CHROMA_DC+0]] << 9
++            |  h->mb.cache.non_zero_count[x264_scan8[CHROMA_DC+1]] << 10;
++    h->mb.cbp[h->mb.i_mb_xy] = cbp;
++    return 1;
++}

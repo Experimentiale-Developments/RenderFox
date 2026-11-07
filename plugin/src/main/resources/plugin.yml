@@ -1,0 +1,16 @@
+name: RenderFox
+version: ${project.version}
+main: net.experimentiale.renderfox.observer.RenderFoxPlugin
+api-version: '26.2'
+author: Experimentiale Developments
+website: https://github.com/Experimentiale-Developments/RenderFox
+description: Mirrors an area of the world to a Render Fox engine, which streams it live. Read-only.
+commands:
+  renderfox:
+    description: Pair this server with a Render Fox engine and show how the feed is doing.
+    usage: /renderfox [status | pair <host[:port]> <code> | unpair | key | reload]
+    permission: renderfox.admin
+permissions:
+  renderfox.admin:
+    description: Pair, unpair and inspect the Render Fox observer.
+    default: op

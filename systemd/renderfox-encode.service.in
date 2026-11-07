@@ -1,0 +1,17 @@
+[Unit]
+Description=Render Fox encoder: the engine's H.264 and the radio's audio (AAC) to the relay beside it
+After=network-online.target renderfox-relay.service
+Wants=network-online.target renderfox-relay.service
+StartLimitIntervalSec=0
+
+[Service]
+User=@RF_USER@
+Environment=RF_RELAY=rtmp://127.0.0.1:1935/fm
+ExecStart=@RF_HOME@/stream/encode.sh
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

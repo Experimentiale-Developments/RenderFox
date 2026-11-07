@@ -1,0 +1,15 @@
+[Unit]
+Description=Render Fox backup uplink to the ingest (YouTube's b.rtmps)
+After=renderfox-relay.service
+Wants=renderfox-relay.service
+ConditionPathExists=@RF_HOME@/relay/uplink.env
+StartLimitIntervalSec=0
+
+[Service]
+User=@RF_USER@
+ExecStart=@RF_HOME@/relay/uplink.sh backup
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

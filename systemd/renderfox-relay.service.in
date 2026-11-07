@@ -1,0 +1,14 @@
+[Unit]
+Description=Render Fox relay (MediaMTX): the encoder in, the uplinks out, localhost only
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=@RF_USER@
+WorkingDirectory=@RF_HOME@/relay
+ExecStart=@RF_HOME@/deps/mediamtx @RF_HOME@/relay/relay.yml
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

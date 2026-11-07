@@ -1,0 +1,490 @@
+diff --git a/common/base.c b/common/base.c
+index 34277277..91483f2f 100644
+--- a/common/base.c
++++ b/common/base.c
+@@ -269,6 +269,7 @@ REALIGN_STACK void x264_picture_init( x264_picture_t *pic )
+     pic->i_type = X264_TYPE_AUTO;
+     pic->i_qpplus1 = X264_QP_AUTO;
+     pic->i_pic_struct = PIC_STRUCT_AUTO;
++    pic->i_idr_pic_id = -1;
+ }
+ 
+ /****************************************************************************
+diff --git a/common/common.h b/common/common.h
+index a22e2249..ac2cb315 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -77,6 +77,8 @@
+ #   define PARAM_INTERLACED 0
+ #endif
+ 
++#define REGION_ACTIVE( param ) ((param)->region.i_x1 > (param)->region.i_x0 && (param)->region.i_y1 > (param)->region.i_y0)
++
+ #ifdef CHROMA_FORMAT
+ #    define CHROMA_H_SHIFT (CHROMA_FORMAT == CHROMA_420 || CHROMA_FORMAT == CHROMA_422)
+ #    define CHROMA_V_SHIFT (CHROMA_FORMAT == CHROMA_420)
+@@ -487,6 +489,13 @@ struct x264_t
+         ALIGNED_8( int16_t mv_limit_fpel[2][2] ); /* min_x, min_y, max_x, max_y */
+         int     mv_miny_fpel_row[3];
+         int     mv_maxy_fpel_row[3];
++        /* The row's vertical subpel range before the region narrows it for one macroblock */
++        int     region_spel_y[2];
++        /* The current macroblock's vectors that keep it on its side of the region's edge:
++         * [axis][whole pixel, fractional][min, max] */
++        int     region_mv[2][2][2];
++        /* Axes on which the current macroblock's vectors must be whole pixels */
++        int     region_lock[2];
+ 
+         /* neighboring MBs */
+         unsigned int i_neighbour;
+diff --git a/common/frame.c b/common/frame.c
+index 7f19e1bd..a1bb1793 100644
+--- a/common/frame.c
++++ b/common/frame.c
+@@ -404,6 +404,7 @@ int x264_frame_copy_picture( x264_t *h, x264_frame_t *dst, x264_picture_t *src )
+     dst->i_pic_struct = src->i_pic_struct;
+     dst->extra_sei  = src->extra_sei;
+     dst->opaque     = src->opaque;
++    dst->i_idr_pic_id = src->i_idr_pic_id;
+     dst->mb_info    = h->param.analyse.b_mb_info ? src->prop.mb_info : NULL;
+     dst->mb_info_free = h->param.analyse.b_mb_info ? src->prop.mb_info_free : NULL;
+ 
+diff --git a/common/frame.h b/common/frame.h
+index c66bcc5b..48d04b42 100644
+--- a/common/frame.h
++++ b/common/frame.h
+@@ -172,6 +172,7 @@ typedef struct x264_frame
+ 
+     /* user data */
+     void *opaque;
++    int     i_idr_pic_id;
+ 
+     /* user frame properties */
+     uint8_t *mb_info;
+diff --git a/common/macroblock.h b/common/macroblock.h
+index 1cdb03bb..8fafed0a 100644
+--- a/common/macroblock.h
++++ b/common/macroblock.h
+@@ -368,6 +368,19 @@ void x264_mb_mc( x264_t *h );
+ #define x264_mb_mc_8x8 x264_template(mb_mc_8x8)
+ void x264_mb_mc_8x8( x264_t *h, int i8 );
+ 
++/* Whether a motion vector keeps the current macroblock's predictions on its own side of
++ * the region's edge; a fractional component reaches further, by the interpolation filter. */
++static ALWAYS_INLINE int x264_mb_region_mv_ok( x264_t *h, const int16_t mv[2] )
++{
++    for( int i = 0; i < 2; i++ )
++    {
++        const int *b = h->mb.region_mv[i][(mv[i]&3) != 0];
++        if( mv[i] < b[0] || mv[i] > b[1] )
++            return 0;
++    }
++    return 1;
++}
++
+ static ALWAYS_INLINE uint32_t pack16to32( uint32_t a, uint32_t b )
+ {
+ #if WORDS_BIGENDIAN
+diff --git a/common/mvpred.c b/common/mvpred.c
+index ecd92c03..f8bf3e9d 100644
+--- a/common/mvpred.c
++++ b/common/mvpred.c
+@@ -466,6 +466,13 @@ int x264_mb_predict_mv_direct16x16( x264_t *h, int *b_changed )
+     else
+         b_available = mb_predict_mv_direct16x16_temporal( h );
+ 
++    /* Direct vectors are derived rather than searched, so nothing kept them out of the region. */
++    if( b_available && REGION_ACTIVE( &h->param ) )
++        for( int i = 0; i < 16 && b_available; i++ )
++            for( int l = 0; l < 2; l++ )
++                if( h->mb.cache.ref[l][x264_scan8[i]] >= 0 && !x264_mb_region_mv_ok( h, h->mb.cache.mv[l][x264_scan8[i]] ) )
++                    b_available = 0;
++
+     if( b_changed != NULL && b_available )
+     {
+         int changed;
+diff --git a/encoder/analyse.c b/encoder/analyse.c
+index adb63e1c..83a4d51d 100644
+--- a/encoder/analyse.c
++++ b/encoder/analyse.c
+@@ -291,6 +291,93 @@ static void mb_analyse_init_qp( x264_t *h, x264_mb_analysis_t *a, int qp )
+     h->mb.i_chroma_qp = h->chroma_qp_table[qp];
+ }
+ 
++/* Narrows motion search so that no prediction crosses the region's edge. A 16x16 block at
++ * pixel p with a qpel vector component v reads p + (v>>2) to p + 15 + (v>>2), and where v
++ * is fractional the 6-tap luma filter reaches 2 further before and 3 after; chroma's
++ * bilinear filter never reaches as far, and a whole-pixel component needs no filter on
++ * its axis. Next to the edge, where the fractional bounds would shut out the zero vector,
++ * the search keeps that axis to whole pixels, which may come right up to the edge: static
++ * content there can still be skipped, and the other axis stays as precise as ever. */
++static void mb_analyse_region( x264_t *h, x264_mb_analysis_t *a, int i_fpel_border )
++{
++    int x0 = h->param.region.i_x0, y0 = h->param.region.i_y0;
++    int x1 = h->param.region.i_x1, y1 = h->param.region.i_y1;
++    int mb_x = h->mb.i_mb_x, mb_y = h->mb.i_mb_y;
++    int p[2] = { 16*mb_x, 16*mb_y };
++    /* The pixels this macroblock may read, per axis; an open end is unbounded. */
++    int first[2] = { INT_MIN, INT_MIN }, last[2] = { INT_MAX, INT_MAX };
++    if( mb_x >= x0 && mb_x < x1 && mb_y >= y0 && mb_y < y1 )
++    {
++        /* Inside stays inside. A side on the frame's edge is open: the padding past it
++         * repeats the region's own pixels. */
++        if( x0 > 0 )
++            first[0] = 16*x0;
++        if( x1 < h->mb.i_mb_width )
++            last[0] = 16*x1 - 1;
++        if( y0 > 0 )
++            first[1] = 16*y0;
++        if( y1 < h->mb.i_mb_height )
++            last[1] = 16*y1 - 1;
++    }
++    else
++    {
++        /* Outside keeps off the region on whichever side leaves it most room, ties going
++         * to the vertical (the stream's camera pans). */
++        int room = -1, side = 0;
++        if( mb_x >= x1 && 16*(mb_x - x1) > room )
++            room = 16*(mb_x - x1), side = 0;
++        if( mb_x < x0 && 16*(x0 - 1 - mb_x) > room )
++            room = 16*(x0 - 1 - mb_x), side = 1;
++        if( mb_y < y0 && 16*(y0 - 1 - mb_y) >= room )
++            room = 16*(y0 - 1 - mb_y), side = 2;
++        if( mb_y >= y1 && 16*(mb_y - y1) >= room )
++            room = 16*(mb_y - y1), side = 3;
++        if( side == 0 )
++            first[0] = 16*x1;
++        else if( side == 1 )
++            last[0] = 16*x0 - 1;
++        else if( side == 2 )
++            last[1] = 16*y0 - 1;
++        else
++            first[1] = 16*y1;
++    }
++
++    for( int i = 0; i < 2; i++ )
++    {
++        int (*b)[2] = h->mb.region_mv[i];
++        b[0][0] = first[i] == INT_MIN ? INT_MIN : 4*(first[i] - p[i]);
++        b[0][1] = last[i] == INT_MAX ? INT_MAX : 4*(last[i] - p[i] - 15);
++        b[1][0] = first[i] == INT_MIN ? INT_MIN : 4*(first[i] - p[i] + 2);
++        b[1][1] = last[i] == INT_MAX ? INT_MAX : 4*(last[i] - p[i] - 18) + 3;
++        h->mb.region_lock[i] = b[1][0] > 0 || b[1][1] < 0;
++    }
++    if( h->mb.region_lock[0] || h->mb.region_lock[1] )
++    {
++        /* Only refine_subpel keeps to the locks: not subpel predictors (subme 3 and up),
++         * bidir refinement or RD refinement. */
++        h->mb.i_subpel_refine = X264_MIN( h->mb.i_subpel_refine, 2 );
++        a->i_mbrd = X264_MIN( a->i_mbrd, 1 );
++    }
++
++    /* The vertical range is set once per row; start from the row's, not the last macroblock's. */
++    h->mb.mv_min_spel[1] = h->mb.region_spel_y[0];
++    h->mb.mv_max_spel[1] = h->mb.region_spel_y[1];
++    for( int i = 0; i < 2; i++ )
++    {
++        int lo = h->mb.region_mv[i][!h->mb.region_lock[i]][0], hi = h->mb.region_mv[i][!h->mb.region_lock[i]][1];
++        /* x264's own border keeps its search clear of the frame's and threads' limits; the
++         * region's needs none, as every vector found is clipped to it (me.c). */
++        int fpel_lo = X264_MAX( (h->mb.mv_min_spel[i]>>2) + i_fpel_border, lo == INT_MIN ? INT_MIN : (lo + 3) >> 2 );
++        int fpel_hi = X264_MIN( (h->mb.mv_max_spel[i]>>2) - i_fpel_border, hi == INT_MAX ? INT_MAX : hi >> 2 );
++        h->mb.mv_min_spel[i] = X264_MAX( h->mb.mv_min_spel[i], lo );
++        h->mb.mv_max_spel[i] = X264_MIN( h->mb.mv_max_spel[i], hi );
++        if( fpel_lo > fpel_hi )
++            fpel_lo = fpel_hi = x264_clip3( 0, (h->mb.mv_min_spel[i] + 3) >> 2, h->mb.mv_max_spel[i] >> 2 );
++        h->mb.mv_limit_fpel[0][i] = fpel_lo;
++        h->mb.mv_limit_fpel[1][i] = fpel_hi;
++    }
++}
++
+ static void mb_analyse_init( x264_t *h, x264_mb_analysis_t *a, int qp )
+ {
+     int subme = h->param.analyse.i_subpel_refine - (h->sh.i_type == SLICE_TYPE_B);
+@@ -394,8 +481,12 @@ static void mb_analyse_init( x264_t *h, x264_mb_analysis_t *a, int qp )
+                 h->mb.mv_max_spel[1] = X264_MIN3( h->mb.mv_max[1], i_fmv_range-1, 4*thread_mvy_range );
+                 h->mb.mv_limit_fpel[0][1] = (h->mb.mv_min_spel[1]>>2) + i_fpel_border;
+                 h->mb.mv_limit_fpel[1][1] = (h->mb.mv_max_spel[1]>>2) - i_fpel_border;
++                h->mb.region_spel_y[0] = h->mb.mv_min_spel[1];
++                h->mb.region_spel_y[1] = h->mb.mv_max_spel[1];
+             }
+         }
++        if( REGION_ACTIVE( &h->param ) )
++            mb_analyse_region( h, a, i_fpel_border );
+         if( PARAM_INTERLACED )
+         {
+             int i = MB_INTERLACED ? 2 : h->mb.i_mb_y&1;
+@@ -1994,7 +2085,9 @@ static void mb_analyse_inter_b16x16( x264_t *h, x264_mb_analysis_t *a )
+         a->i_cost16x16bi += analyse_bi_chroma( h, a, 0, PIXEL_16x16 );
+ 
+     /* Always try the 0,0,0,0 vector; helps avoid errant motion vectors in fades */
+-    if( M32( a->l0.bi16x16.mv ) | M32( a->l1.bi16x16.mv ) )
++    static const int16_t zero_mv[2] = { 0, 0 };
++    if( (M32( a->l0.bi16x16.mv ) | M32( a->l1.bi16x16.mv )) &&
++        (!REGION_ACTIVE( &h->param ) || x264_mb_region_mv_ok( h, zero_mv )) )
+     {
+         int l0_mv_cost = a->l0.bi16x16.p_cost_mv[-a->l0.bi16x16.mvp[0]]
+                        + a->l0.bi16x16.p_cost_mv[-a->l0.bi16x16.mvp[1]];
+@@ -2994,7 +3087,8 @@ intra_analysis:
+                     h->fdec->mb_info[h->mb.i_mb_xy] &= ~X264_MBINFO_CONSTANT;
+             }
+ 
+-            int skip_invalid = h->i_thread_frames > 1 && h->mb.cache.pskip_mv[1] > h->mb.mv_max_spel[1];
++            int skip_invalid = (h->i_thread_frames > 1 && h->mb.cache.pskip_mv[1] > h->mb.mv_max_spel[1]) ||
++                               (REGION_ACTIVE( &h->param ) && !x264_mb_region_mv_ok( h, h->mb.cache.pskip_mv ));
+             /* If the current macroblock is off the frame, just skip it. */
+             if( HAVE_INTERLACED && !MB_INTERLACED && h->mb.i_mb_y * 16 >= h->param.i_height && !skip_invalid )
+                 b_skip = 1;
+diff --git a/encoder/encoder.c b/encoder/encoder.c
+index 20e620aa..4f4189bf 100644
+--- a/encoder/encoder.c
++++ b/encoder/encoder.c
+@@ -203,7 +203,7 @@ static void slice_header_init( x264_t *h, x264_slice_header_t *sh,
+     int deblock_thresh = i_qp + 2 * X264_MIN(param->i_deblocking_filter_alphac0, param->i_deblocking_filter_beta);
+     /* If effective qp <= 15, deblocking would have no effect anyway */
+     if( param->b_deblocking_filter && (h->mb.b_variable_qp || 15 < deblock_thresh ) )
+-        sh->i_disable_deblocking_filter_idc = param->b_sliced_threads ? 2 : 0;
++        sh->i_disable_deblocking_filter_idc = param->b_sliced_threads || REGION_ACTIVE( param ) ? 2 : 0;
+     else
+         sh->i_disable_deblocking_filter_idc = 1;
+     sh->i_alpha_c0_offset = param->i_deblocking_filter_alphac0 * 2;
+@@ -556,6 +556,35 @@ static int validate_parameters( x264_t *h, int b_open )
+         h->param.vui.i_sar_height = 0;
+     }
+ 
++    if( REGION_ACTIVE( &h->param ) )
++    {
++        int mbw = (h->param.i_width + 15) / 16, mbh = (h->param.i_height + 15) / 16;
++        int x0 = h->param.region.i_x0, y0 = h->param.region.i_y0;
++        int x1 = h->param.region.i_x1, y1 = h->param.region.i_y1;
++        /* The macroblocks along an edge inside the frame may only point away from it, by
++         * the 6-tap filter's reach; three deep leaves the search room past its safety border. */
++        if( x0 < 0 || y0 < 0 || x1 > mbw || y1 > mbh ||
++            ((x0 > 0 || x1 < mbw) && x1 - x0 < 3) || ((y0 > 0 || y1 < mbh) && y1 - y0 < 3) )
++        {
++            x264_log( h, X264_LOG_ERROR, "region %d,%d-%d,%d does not fit %dx%d macroblocks\n", x0, y0, x1, y1, mbw, mbh );
++            return -1;
++        }
++        if( h->param.b_interlaced || h->param.b_fake_interlaced || h->param.b_sliced_threads || h->param.b_intra_refresh ||
++            h->param.i_slice_max_size || h->param.i_slice_max_mbs || h->param.i_slice_count || h->param.i_slice_count_max )
++            x264_log( h, X264_LOG_WARNING, "region: interlacing, sliced threads, intra refresh and slice options are off\n" );
++        h->param.b_interlaced = 0;
++        h->param.b_fake_interlaced = 0;
++        h->param.b_sliced_threads = 0;
++        h->param.b_intra_refresh = 0;
++        h->param.i_slice_max_size = 0;
++        h->param.i_slice_max_mbs = 0;
++        h->param.i_slice_count = 0;
++        h->param.i_slice_count_max = 0;
++        h->param.analyse.b_mb_info = 0;
++    }
++    else
++        memset( &h->param.region, 0, sizeof(h->param.region) );
++
+     if( h->param.i_threads == X264_THREADS_AUTO )
+     {
+         h->param.i_threads = x264_cpu_num_processors() * (h->param.b_sliced_threads?2:3)/2;
+@@ -2610,7 +2639,8 @@ static inline void slice_init( x264_t *h, int i_nal_type, int i_global_qp )
+     /* ------------------------ Create slice header  ----------------------- */
+     if( i_nal_type == NAL_SLICE_IDR )
+     {
+-        slice_header_init( h, &h->sh, h->sps, h->pps, h->i_idr_pic_id, h->i_frame_num, i_global_qp );
++        int idr_pic_id = h->fenc->i_idr_pic_id >= 0 ? h->fenc->i_idr_pic_id & 0xffff : h->i_idr_pic_id;
++        slice_header_init( h, &h->sh, h->sps, h->pps, idr_pic_id, h->i_frame_num, i_global_qp );
+ 
+         /* alternate id */
+         if( h->param.i_avcintra_class )
+@@ -3197,6 +3227,27 @@ static void *slices_write( x264_t *h )
+                 i_slice_num++;
+                 h->sh.i_last_mb = (height * i_slice_num + round_bias) / h->param.i_slice_count * width - 1;
+             }
++            else if( REGION_ACTIVE( &h->param ) )
++            {
++                /* Slices break where a row enters and leaves the region. */
++                int width = h->mb.i_mb_width;
++                int x = h->sh.i_first_mb % width, y = h->sh.i_first_mb / width;
++                int x0 = h->param.region.i_x0, y0 = h->param.region.i_y0;
++                int x1 = h->param.region.i_x1, y1 = h->param.region.i_y1;
++                int next;
++                if( y < y0 )
++                    next = y0 * width + x0;
++                else if( y >= y1 )
++                    next = last_thread_mb + 1;
++                else if( x < x0 )
++                    next = y * width + x0;
++                else if( x < x1 )
++                    next = y * width + x1;
++                else
++                    next = y + 1 < y1 ? (y + 1) * width + x0 : last_thread_mb + 1;
++                h->sh.i_last_mb = next - 1;
++                i_slice_num++;
++            }
+         }
+         h->sh.i_last_mb = X264_MIN( h->sh.i_last_mb, last_thread_mb );
+         if( slice_write( h ) )
+diff --git a/encoder/me.c b/encoder/me.c
+index 89a039d4..ada2c318 100644
+--- a/encoder/me.c
++++ b/encoder/me.c
+@@ -57,6 +57,17 @@ static const int8_t square1[9][2] = {{0,0}, {0,-1}, {0,1}, {-1,0}, {1,0}, {-1,-1
+ 
+ static void refine_subpel( x264_t *h, x264_me_t *m, int hpel_iters, int qpel_iters, int *p_halfpel_thresh, int b_refine_qpel );
+ 
++/* Searches may step a little past their range; with a region, that step could cross its
++ * edge, so the vector found is pulled back inside. */
++static void region_clip( x264_t *h, x264_me_t *m )
++{
++    if( REGION_ACTIVE( &h->param ) )
++    {
++        m->mv[0] = x264_clip3( m->mv[0], h->mb.mv_min_spel[0], h->mb.mv_max_spel[0] );
++        m->mv[1] = x264_clip3( m->mv[1], h->mb.mv_min_spel[1], h->mb.mv_max_spel[1] );
++    }
++}
++
+ #define BITS_MVD( mx, my )\
+     (p_cost_mvx[(mx)*4] + p_cost_mvy[(my)*4])
+ 
+@@ -207,6 +218,8 @@ void x264_me_search_ref( x264_t *h, x264_me_t *m, int16_t (*mvc)[2], int i_mvc,
+     uint32_t pmv, bpred_mv = 0;
+ 
+ #define CHECK_MVRANGE(mx,my) (!(((pack16to32_mask2(mx,my) + mv_min) | (mv_max - pack16to32_mask2(mx,my))) & 0x80004000))
++    /* The zero vector is tried unclipped, always in range but for a region's edge. */
++    int zero_ok = !REGION_ACTIVE( &h->param ) || CHECK_MVRANGE( 0, 0 );
+ 
+     const uint16_t *p_cost_mvx = m->p_cost_mv - m->mvp[0];
+     const uint16_t *p_cost_mvy = m->p_cost_mv - m->mvp[1];
+@@ -263,7 +276,7 @@ void x264_me_search_ref( x264_t *h, x264_me_t *m, int16_t (*mvc)[2], int i_mvc,
+         /* Test the zero vector if it hasn't been tested yet. */
+         if( pmv )
+         {
+-            if( bmx|bmy ) COST_MV( 0, 0 );
++            if( (bmx|bmy) && zero_ok ) COST_MV( 0, 0 );
+         }
+         /* If a subpel mv candidate was better than the zero vector, the previous
+          * fullpel check won't have gotten it even if the pmv was zero. So handle
+@@ -313,7 +326,7 @@ void x264_me_search_ref( x264_t *h, x264_me_t *m, int16_t (*mvc)[2], int i_mvc,
+         }
+ 
+         /* Same as above, except the condition is simpler. */
+-        if( pmv )
++        if( pmv && zero_ok )
+             COST_MV( 0, 0 );
+     }
+ 
+@@ -795,6 +808,7 @@ void x264_me_search_ref( x264_t *h, x264_me_t *m, int16_t (*mvc)[2], int i_mvc,
+         int qpel = subpel_iterations[h->mb.i_subpel_refine][3];
+         refine_subpel( h, m, hpel, qpel, p_halfpel_thresh, 0 );
+     }
++    region_clip( h, m );
+ }
+ #undef COST_MV
+ 
+@@ -807,11 +821,13 @@ void x264_me_refine_qpel( x264_t *h, x264_me_t *m )
+         m->cost -= m->i_ref_cost;
+ 
+     refine_subpel( h, m, hpel, qpel, NULL, 1 );
++    region_clip( h, m );
+ }
+ 
+ void x264_me_refine_qpel_refdupe( x264_t *h, x264_me_t *m, int *p_halfpel_thresh )
+ {
+     refine_subpel( h, m, 0, X264_MIN( 2, subpel_iterations[h->mb.i_subpel_refine][3] ), p_halfpel_thresh, 0 );
++    region_clip( h, m );
+ }
+ 
+ #define COST_MV_SAD( mx, my ) \
+@@ -881,6 +897,10 @@ static void refine_subpel( x264_t *h, x264_me_t *m, int hpel_iters, int qpel_ite
+     int bmy = m->mv[1];
+     int bcost = m->cost;
+     int odir = -1, bdir;
++    /* A region can hold an axis to whole pixels (analyse.c); moves along it are priced out. */
++    int lock_x = REGION_ACTIVE( &h->param ) && h->mb.region_lock[0];
++    int lock_y = REGION_ACTIVE( &h->param ) && h->mb.region_lock[1];
++    const int locked = 1<<24;
+ 
+     /* halfpel diamond search */
+     if( hpel_iters )
+@@ -890,7 +910,7 @@ static void refine_subpel( x264_t *h, x264_me_t *m, int hpel_iters, int qpel_ite
+         {
+             int mx = x264_clip3( m->mvp[0], h->mb.mv_min_spel[0]+2, h->mb.mv_max_spel[0]-2 );
+             int my = x264_clip3( m->mvp[1], h->mb.mv_min_spel[1]+2, h->mb.mv_max_spel[1]-2 );
+-            if( (mx-bmx)|(my-bmy) )
++            if( ((mx-bmx)|(my-bmy)) && !(lock_x && (mx&3)) && !(lock_y && (my&3)) )
+                 COST_MV_SAD( mx, my );
+         }
+ 
+@@ -909,6 +929,10 @@ static void refine_subpel( x264_t *h, x264_me_t *m, int hpel_iters, int qpel_ite
+             costs[1] += p_cost_mvx[omx  ] + p_cost_mvy[omy+2];
+             costs[2] += p_cost_mvx[omx-2] + p_cost_mvy[omy  ];
+             costs[3] += p_cost_mvx[omx+2] + p_cost_mvy[omy  ];
++            if( lock_y )
++                costs[0] = costs[1] = locked;
++            if( lock_x )
++                costs[2] = costs[3] = locked;
+             COPY1_IF_LT( bcost, (costs[0]<<6)+2 );
+             COPY1_IF_LT( bcost, (costs[1]<<6)+6 );
+             COPY1_IF_LT( bcost, (costs[2]<<6)+16 );
+@@ -953,10 +977,16 @@ static void refine_subpel( x264_t *h, x264_me_t *m, int hpel_iters, int qpel_ite
+                 break;
+             odir = bdir;
+             int omx = bmx, omy = bmy;
+-            COST_MV_SATD( omx, omy - 1, 0 );
+-            COST_MV_SATD( omx, omy + 1, 1 );
+-            COST_MV_SATD( omx - 1, omy, 2 );
+-            COST_MV_SATD( omx + 1, omy, 3 );
++            if( !lock_y )
++            {
++                COST_MV_SATD( omx, omy - 1, 0 );
++                COST_MV_SATD( omx, omy + 1, 1 );
++            }
++            if( !lock_x )
++            {
++                COST_MV_SATD( omx - 1, omy, 2 );
++                COST_MV_SATD( omx + 1, omy, 3 );
++            }
+             if( (bmx == omx) & (bmy == omy) )
+                 break;
+         }
+@@ -975,6 +1005,10 @@ static void refine_subpel( x264_t *h, x264_me_t *m, int hpel_iters, int qpel_ite
+         costs[1] += p_cost_mvx[omx  ] + p_cost_mvy[omy+1];
+         costs[2] += p_cost_mvx[omx-1] + p_cost_mvy[omy  ];
+         costs[3] += p_cost_mvx[omx+1] + p_cost_mvy[omy  ];
++        if( lock_y )
++            costs[0] = costs[1] = locked;
++        if( lock_x )
++            costs[2] = costs[3] = locked;
+         bcost <<= 4;
+         COPY1_IF_LT( bcost, (costs[0]<<4)+1 );
+         COPY1_IF_LT( bcost, (costs[1]<<4)+3 );
+diff --git a/x264.h b/x264.h
+index cc22f05d..b7f3d641 100644
+--- a/x264.h
++++ b/x264.h
+@@ -619,6 +619,17 @@ typedef struct x264_param_t
+ 
+     /* For internal use only */
+     void *opaque;
++
++    /* A rectangle of macroblocks, [x0,x1) x [y0,y1), encoded so that another encode of
++     * the same frames can take its place in the bitstream: it is coded in slices of its
++     * own, nothing inside it is predicted from outside it or outside from inside, and no
++     * deblocking crosses a slice edge. Two encoders with the same parameters and frame
++     * types then produce slices that can be mixed freely, frame by frame. Off unless
++     * x1 > x0 and y1 > y0; a side not on the frame's edge needs it 3 deep. */
++    struct
++    {
++        int i_x0, i_y0, i_x1, i_y1;
++    } region;
+ } x264_param_t;
+ 
+ X264_API void x264_nal_encode( x264_t *h, uint8_t *dst, x264_nal_t *nal );
+@@ -903,6 +914,9 @@ typedef struct x264_picture_t
+     x264_sei_t extra_sei;
+     /* private user data. copied from input to output frames. */
+     void *opaque;
++    /* In: idr_pic_id to write if this frame becomes an IDR, 0..65535, or -1 to let
++     * x264 alternate it. Slices of one picture from two encoders must agree on it. */
++    int     i_idr_pic_id;
+ } x264_picture_t;
+ 
+ /* x264_picture_init:

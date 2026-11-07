@@ -1,0 +1,361 @@
+--- a/x264.h
++++ b/x264.h
+@@ -633,6 +633,12 @@
+          * nor encoded (its slices come out empty and meaningless) and its rows are not
+          * filtered. For an encoder that recodes just the region. */
+         int b_only;
++        /* Horizontal bands, coded apart from one another as the region is from the rest:
++         * i_bands macroblock rows where one band ends and the next begins, increasing.
++         * With a region, its rows must be those of one band. Zones are numbered 0 for the
++         * region and 1 + k for band k (counted from the top, its region part left out). */
++        int i_bands;
++        int i_band_y[16];
+     } region;
+ } x264_param_t;
+ 
+@@ -921,6 +927,9 @@
+     /* In: idr_pic_id to write if this frame becomes an IDR, 0..65535, or -1 to let
+      * x264 alternate it. Slices of one picture from two encoders must agree on it. */
+     int     i_idr_pic_id;
++    /* In, with region.b_only: the zones to encode, bit z for zone z; 0 means the region
++     * alone. Change it only on an IDR: a zone not encoded has nothing to predict from. */
++    int     i_region_zones;
+ } x264_picture_t;
+ 
+ /* x264_picture_init:
+--- a/common/common.h
++++ b/common/common.h
+@@ -79,6 +79,44 @@
+ 
+ #define REGION_ACTIVE( param ) ((param)->region.i_x1 > (param)->region.i_x0 && (param)->region.i_y1 > (param)->region.i_y0)
+ #define REGION_HOLDS( param, x, y ) ((x) >= (param)->region.i_x0 && (x) < (param)->region.i_x1 && (y) >= (param)->region.i_y0 && (y) < (param)->region.i_y1)
++/* A region, bands or both: zones that never predict from one another. */
++#define ZONES_ACTIVE( param ) (REGION_ACTIVE( param ) || (param)->region.i_bands > 0)
++
++/* The band holding macroblock row y, and its rows [top, bottom). */
++static inline int x264_band_of( const x264_param_t *p, int y )
++{
++    int b = 0;
++    while( b < p->region.i_bands && y >= p->region.i_band_y[b] )
++        b++;
++    return b;
++}
++static inline int x264_band_top( const x264_param_t *p, int b )
++{
++    return b > 0 ? p->region.i_band_y[b-1] : 0;
++}
++static inline int x264_band_bottom( const x264_param_t *p, int b, int mb_height )
++{
++    return b < p->region.i_bands ? p->region.i_band_y[b] : mb_height;
++}
++/* The zone of macroblock (x, y): 0 in the region, 1 + its band elsewhere. */
++static inline int x264_zone_of( const x264_param_t *p, int x, int y )
++{
++    return REGION_HOLDS( p, x, y ) ? 0 : 1 + x264_band_of( p, y );
++}
++/* Whether macroblock row y holds any of `zones`. */
++static inline int x264_zones_row( const x264_param_t *p, int zones, int y )
++{
++    if( (zones & 1) && y >= p->region.i_y0 && y < p->region.i_y1 )
++        return 1;
++    if( zones & ~1 )
++    {
++        int b = x264_band_of( p, y );
++        /* A band's own zone covers its rows, unless the region fills them all. */
++        if( (zones >> (1 + b)) & 1 )
++            return 1;
++    }
++    return 0;
++}
+ 
+ #ifdef CHROMA_FORMAT
+ #    define CHROMA_H_SHIFT (CHROMA_FORMAT == CHROMA_420 || CHROMA_FORMAT == CHROMA_422)
+--- a/common/frame.c
++++ b/common/frame.c
+@@ -405,6 +405,7 @@
+     dst->extra_sei  = src->extra_sei;
+     dst->opaque     = src->opaque;
+     dst->i_idr_pic_id = src->i_idr_pic_id;
++    dst->i_region_zones = src->i_region_zones ? src->i_region_zones : 1;
+     dst->mb_info    = h->param.analyse.b_mb_info ? src->prop.mb_info : NULL;
+     dst->mb_info_free = h->param.analyse.b_mb_info ? src->prop.mb_info_free : NULL;
+ 
+@@ -446,9 +447,19 @@
+         get_plane_ptr( h, src, &pix[0], &stride[0], 0, 0, 0 );
+         if( h->param.region.b_only && i_csp == X264_CSP_I420 )
+         {
+-            /* Only the region is encoded: only its rows, and a macroblock either side, are read. */
+-            int y0 = X264_MAX( 16*h->param.region.i_y0 - 16, 0 );
+-            int y1 = X264_MIN( 16*h->param.region.i_y1 + 16, h->param.i_height );
++            /* Only some zones are encoded: only their rows, and a macroblock either side, are read. */
++            int zones = src->i_region_zones ? src->i_region_zones : 1;
++            int lo = h->mb.i_mb_height, hi = 0;
++            for( int y = 0; y < h->mb.i_mb_height; y++ )
++                if( x264_zones_row( &h->param, zones, y ) )
++                {
++                    lo = X264_MIN( lo, y );
++                    hi = y + 1;
++                }
++            if( hi <= lo )
++                lo = hi = 0;
++            int y0 = X264_MAX( 16*lo - 16, 0 );
++            int y1 = X264_MIN( 16*hi + 16, h->param.i_height );
+             get_plane_ptr( h, src, &pix[1], &stride[1], 1, 1, v_shift );
+             get_plane_ptr( h, src, &pix[2], &stride[2], 2, 1, v_shift );
+             h->mc.plane_copy( dst->plane[0] + y0*dst->i_stride[0], dst->i_stride[0], (pixel*)pix[0] + y0*(stride[0]/SIZEOF_PIXEL),
+--- a/common/frame.h
++++ b/common/frame.h
+@@ -173,6 +173,7 @@
+     /* user data */
+     void *opaque;
+     int     i_idr_pic_id;
++    int     i_region_zones;
+ 
+     /* user frame properties */
+     uint8_t *mb_info;
+--- a/common/base.c
++++ b/common/base.c
+@@ -270,6 +270,7 @@
+     pic->i_qpplus1 = X264_QP_AUTO;
+     pic->i_pic_struct = PIC_STRUCT_AUTO;
+     pic->i_idr_pic_id = -1;
++    pic->i_region_zones = 0;
+ }
+ 
+ /****************************************************************************
+--- a/common/mvpred.c
++++ b/common/mvpred.c
+@@ -467,7 +467,7 @@
+         b_available = mb_predict_mv_direct16x16_temporal( h );
+ 
+     /* Direct vectors are derived rather than searched, so nothing kept them out of the region. */
+-    if( b_available && REGION_ACTIVE( &h->param ) )
++    if( b_available && ZONES_ACTIVE( &h->param ) )
+         for( int i = 0; i < 16 && b_available; i++ )
+             for( int l = 0; l < 2; l++ )
+                 if( h->mb.cache.ref[l][x264_scan8[i]] >= 0 && !x264_mb_region_mv_ok( h, h->mb.cache.mv[l][x264_scan8[i]] ) )
+--- a/encoder/analyse.c
++++ b/encoder/analyse.c
+@@ -306,7 +306,19 @@
+     int p[2] = { 16*mb_x, 16*mb_y };
+     /* The pixels this macroblock may read, per axis; an open end is unbounded. */
+     int first[2] = { INT_MIN, INT_MIN }, last[2] = { INT_MAX, INT_MAX };
+-    if( mb_x >= x0 && mb_x < x1 && mb_y >= y0 && mb_y < y1 )
++    if( h->param.region.i_bands )
++    {
++        /* A band keeps to its own rows; the frame's edge is open, as for the region. */
++        int b = x264_band_of( &h->param, mb_y );
++        int top = x264_band_top( &h->param, b ), bottom = x264_band_bottom( &h->param, b, h->mb.i_mb_height );
++        if( top > 0 )
++            first[1] = 16*top;
++        if( bottom < h->mb.i_mb_height )
++            last[1] = 16*bottom - 1;
++    }
++    if( !REGION_ACTIVE( &h->param ) || (h->param.region.i_bands && (mb_y < y0 || mb_y >= y1)) )
++        ;   /* the band alone */
++    else if( mb_x >= x0 && mb_x < x1 && mb_y >= y0 && mb_y < y1 )
+     {
+         /* Inside stays inside. A side on the frame's edge is open: the padding past it
+          * repeats the region's own pixels. */
+@@ -485,7 +497,7 @@
+                 h->mb.region_spel_y[1] = h->mb.mv_max_spel[1];
+             }
+         }
+-        if( REGION_ACTIVE( &h->param ) )
++        if( ZONES_ACTIVE( &h->param ) )
+             mb_analyse_region( h, a, i_fpel_border );
+         if( PARAM_INTERLACED )
+         {
+@@ -2087,7 +2099,7 @@
+     /* Always try the 0,0,0,0 vector; helps avoid errant motion vectors in fades */
+     static const int16_t zero_mv[2] = { 0, 0 };
+     if( (M32( a->l0.bi16x16.mv ) | M32( a->l1.bi16x16.mv )) &&
+-        (!REGION_ACTIVE( &h->param ) || x264_mb_region_mv_ok( h, zero_mv )) )
++        (!ZONES_ACTIVE( &h->param ) || x264_mb_region_mv_ok( h, zero_mv )) )
+     {
+         int l0_mv_cost = a->l0.bi16x16.p_cost_mv[-a->l0.bi16x16.mvp[0]]
+                        + a->l0.bi16x16.p_cost_mv[-a->l0.bi16x16.mvp[1]];
+@@ -3088,7 +3100,7 @@
+             }
+ 
+             int skip_invalid = (h->i_thread_frames > 1 && h->mb.cache.pskip_mv[1] > h->mb.mv_max_spel[1]) ||
+-                               (REGION_ACTIVE( &h->param ) && !x264_mb_region_mv_ok( h, h->mb.cache.pskip_mv ));
++                               (ZONES_ACTIVE( &h->param ) && !x264_mb_region_mv_ok( h, h->mb.cache.pskip_mv ));
+             /* If the current macroblock is off the frame, just skip it. */
+             if( HAVE_INTERLACED && !MB_INTERLACED && h->mb.i_mb_y * 16 >= h->param.i_height && !skip_invalid )
+                 b_skip = 1;
+--- a/encoder/encoder.c
++++ b/encoder/encoder.c
+@@ -203,7 +203,7 @@
+     int deblock_thresh = i_qp + 2 * X264_MIN(param->i_deblocking_filter_alphac0, param->i_deblocking_filter_beta);
+     /* If effective qp <= 15, deblocking would have no effect anyway */
+     if( param->b_deblocking_filter && (h->mb.b_variable_qp || 15 < deblock_thresh ) )
+-        sh->i_disable_deblocking_filter_idc = param->b_sliced_threads || REGION_ACTIVE( param ) ? 2 : 0;
++        sh->i_disable_deblocking_filter_idc = param->b_sliced_threads || ZONES_ACTIVE( param ) ? 2 : 0;
+     else
+         sh->i_disable_deblocking_filter_idc = 1;
+     sh->i_alpha_c0_offset = param->i_deblocking_filter_alphac0 * 2;
+@@ -556,15 +556,41 @@
+         h->param.vui.i_sar_height = 0;
+     }
+ 
+-    if( REGION_ACTIVE( &h->param ) )
++    if( h->param.region.i_bands < 0 || h->param.region.i_bands > 16 )
++    {
++        x264_log( h, X264_LOG_ERROR, "region: %d bands, at most 16\n", h->param.region.i_bands );
++        return -1;
++    }
++    for( int b = 0; b < h->param.region.i_bands; b++ )
++    {
++        int mbh = (h->param.i_height + 15) / 16;
++        int top = x264_band_top( &h->param, b ), cut = h->param.region.i_band_y[b];
++        /* Every band at least 3 deep, as the region must be next to an edge inside the frame. */
++        if( cut - top < 3 || cut > mbh - 3 )
++        {
++            x264_log( h, X264_LOG_ERROR, "region: band %d ends at row %d, after row %d, in %d rows\n", b, cut, top, mbh );
++            return -1;
++        }
++    }
++    if( REGION_ACTIVE( &h->param ) && h->param.region.i_bands )
++    {
++        int b = x264_band_of( &h->param, h->param.region.i_y0 );
++        if( x264_band_top( &h->param, b ) != h->param.region.i_y0 ||
++            x264_band_bottom( &h->param, b, (h->param.i_height + 15) / 16 ) != h->param.region.i_y1 )
++        {
++            x264_log( h, X264_LOG_ERROR, "region: rows %d-%d are not those of a band\n", h->param.region.i_y0, h->param.region.i_y1 );
++            return -1;
++        }
++    }
++    if( ZONES_ACTIVE( &h->param ) )
+     {
+         int mbw = (h->param.i_width + 15) / 16, mbh = (h->param.i_height + 15) / 16;
+         int x0 = h->param.region.i_x0, y0 = h->param.region.i_y0;
+         int x1 = h->param.region.i_x1, y1 = h->param.region.i_y1;
+         /* The macroblocks along an edge inside the frame may only point away from it, by
+          * the 6-tap filter's reach; three deep leaves the search room past its safety border. */
+-        if( x0 < 0 || y0 < 0 || x1 > mbw || y1 > mbh ||
+-            ((x0 > 0 || x1 < mbw) && x1 - x0 < 3) || ((y0 > 0 || y1 < mbh) && y1 - y0 < 3) )
++        if( REGION_ACTIVE( &h->param ) && (x0 < 0 || y0 < 0 || x1 > mbw || y1 > mbh ||
++            ((x0 > 0 || x1 < mbw) && x1 - x0 < 3) || ((y0 > 0 || y1 < mbh) && y1 - y0 < 3)) )
+         {
+             x264_log( h, X264_LOG_ERROR, "region %d,%d-%d,%d does not fit %dx%d macroblocks\n", x0, y0, x1, y1, mbw, mbh );
+             return -1;
+@@ -2486,8 +2512,11 @@
+         return;
+     if( min_y < h->i_threadslice_start )
+         return;
+-    /* Rows the region's predictions never reach: nobody reads them. */
+-    if( h->param.region.b_only && (min_y < h->param.region.i_y0 - 1 || min_y > h->param.region.i_y1) && !b_end )
++    /* Rows no encoded zone's predictions reach: nobody reads them. */
++    if( h->param.region.b_only && !b_end &&
++        !x264_zones_row( &h->param, h->fenc->i_region_zones, min_y ) &&
++        !(min_y > 0 && x264_zones_row( &h->param, h->fenc->i_region_zones, min_y - 1 )) &&
++        !(min_y + 1 < h->mb.i_mb_height && x264_zones_row( &h->param, h->fenc->i_region_zones, min_y + 1 )) )
+         return;
+ 
+     if( b_deblock )
+@@ -2890,7 +2919,7 @@
+             h->mb.field[mb_xy] = MB_INTERLACED;
+         }
+ 
+-        if( h->param.region.b_only && !REGION_HOLDS( &h->param, i_mb_x, i_mb_y ) )
++        if( h->param.region.b_only && !((h->fenc->i_region_zones >> x264_zone_of( &h->param, i_mb_x, i_mb_y )) & 1) )
+         {
+             /* A slice outside the region: thrown away, so not worth a macroblock's work. */
+             if( mb_xy == h->sh.i_last_mb )
+@@ -3248,24 +3277,29 @@
+                 i_slice_num++;
+                 h->sh.i_last_mb = (height * i_slice_num + round_bias) / h->param.i_slice_count * width - 1;
+             }
+-            else if( REGION_ACTIVE( &h->param ) )
++            else if( ZONES_ACTIVE( &h->param ) )
+             {
+-                /* Slices break where a row enters and leaves the region. */
++                /* Slices break where a row enters and leaves the region, and between bands. */
+                 int width = h->mb.i_mb_width;
+                 int x = h->sh.i_first_mb % width, y = h->sh.i_first_mb / width;
+-                int x0 = h->param.region.i_x0, y0 = h->param.region.i_y0;
+-                int x1 = h->param.region.i_x1, y1 = h->param.region.i_y1;
+-                int next;
+-                if( y < y0 )
+-                    next = y0 * width + x0;
+-                else if( y >= y1 )
+-                    next = last_thread_mb + 1;
+-                else if( x < x0 )
+-                    next = y * width + x0;
+-                else if( x < x1 )
+-                    next = y * width + x1;
+-                else
+-                    next = y + 1 < y1 ? (y + 1) * width + x0 : last_thread_mb + 1;
++                int next = last_thread_mb + 1;
++                if( REGION_ACTIVE( &h->param ) )
++                {
++                    int x0 = h->param.region.i_x0, y0 = h->param.region.i_y0;
++                    int x1 = h->param.region.i_x1, y1 = h->param.region.i_y1;
++                    if( y < y0 )
++                        next = y0 * width + x0;
++                    else if( y >= y1 )
++                        next = last_thread_mb + 1;
++                    else if( x < x0 )
++                        next = y * width + x0;
++                    else if( x < x1 )
++                        next = y * width + x1;
++                    else
++                        next = y + 1 < y1 ? (y + 1) * width + x0 : last_thread_mb + 1;
++                }
++                if( h->param.region.i_bands )
++                    next = X264_MIN( next, x264_band_bottom( &h->param, x264_band_of( &h->param, y ), h->mb.i_mb_height ) * width );
+                 h->sh.i_last_mb = next - 1;
+                 i_slice_num++;
+             }
+--- a/encoder/me.c
++++ b/encoder/me.c
+@@ -61,7 +61,7 @@
+  * edge, so the vector found is pulled back inside. */
+ static void region_clip( x264_t *h, x264_me_t *m )
+ {
+-    if( REGION_ACTIVE( &h->param ) )
++    if( ZONES_ACTIVE( &h->param ) )
+     {
+         m->mv[0] = x264_clip3( m->mv[0], h->mb.mv_min_spel[0], h->mb.mv_max_spel[0] );
+         m->mv[1] = x264_clip3( m->mv[1], h->mb.mv_min_spel[1], h->mb.mv_max_spel[1] );
+@@ -219,7 +219,7 @@
+ 
+ #define CHECK_MVRANGE(mx,my) (!(((pack16to32_mask2(mx,my) + mv_min) | (mv_max - pack16to32_mask2(mx,my))) & 0x80004000))
+     /* The zero vector is tried unclipped, always in range but for a region's edge. */
+-    int zero_ok = !REGION_ACTIVE( &h->param ) || CHECK_MVRANGE( 0, 0 );
++    int zero_ok = !ZONES_ACTIVE( &h->param ) || CHECK_MVRANGE( 0, 0 );
+ 
+     const uint16_t *p_cost_mvx = m->p_cost_mv - m->mvp[0];
+     const uint16_t *p_cost_mvy = m->p_cost_mv - m->mvp[1];
+@@ -898,8 +898,8 @@
+     int bcost = m->cost;
+     int odir = -1, bdir;
+     /* A region can hold an axis to whole pixels (analyse.c); moves along it are priced out. */
+-    int lock_x = REGION_ACTIVE( &h->param ) && h->mb.region_lock[0];
+-    int lock_y = REGION_ACTIVE( &h->param ) && h->mb.region_lock[1];
++    int lock_x = ZONES_ACTIVE( &h->param ) && h->mb.region_lock[0];
++    int lock_y = ZONES_ACTIVE( &h->param ) && h->mb.region_lock[1];
+     const int locked = 1<<24;
+ 
+     /* halfpel diamond search */
+--- a/encoder/ratecontrol.c
++++ b/encoder/ratecontrol.c
+@@ -389,7 +389,7 @@
+                     qp_adj = frame->f_qp_offset[mb_xy];
+                     qp_adj = strength * (qp_adj - avg_adj);
+                 }
+-                else if( h->param.region.b_only && (mb_y < h->param.region.i_y0 - 1 || mb_y > h->param.region.i_y1) )
++                else if( h->param.region.b_only && !x264_zones_row( &h->param, frame->i_region_zones, mb_y ) )
+                     qp_adj = 0.f; /* outside what is encoded */
+                 else
+                 {
+@@ -1607,7 +1607,7 @@
+         return 0;
+     /* A region recoded at the quantiser it was first coded with keeps it on every row,
+      * whatever the rows before it cost, so its slices never depend on what is outside it. */
+-    if( REGION_ACTIVE( &h->param ) && h->fenc->i_qpplus1 != X264_QP_AUTO )
++    if( ZONES_ACTIVE( &h->param ) && h->fenc->i_qpplus1 != X264_QP_AUTO )
+         return 0;
+ 
+     float qscale = qp2qscale( rc->qpm );

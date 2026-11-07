@@ -1,0 +1,24 @@
+# Render Fox observer. It mirrors the blocks and players around one point of one world to a
+# Render Fox engine, which renders and streams them. It never changes the world.
+
+# The engine, as host:port (port 25590 unless renderfox.json says otherwise). Set by
+# /renderfox pair <host[:port]> <code>; leave empty to keep the observer idle.
+engine: ""
+
+# The world to mirror.
+world: world
+
+# The middle of the mirrored area, in block coordinates. Point the engine's orbit.center
+# (renderfox.json) at the same place.
+center:
+  x: 0
+  z: 0
+
+# How far around the middle to mirror, in blocks (16 to 512). The engine's fog and orbit
+# are tuned for 224.
+radius: 224
+
+# Chunks captured per tick while the first snapshot loads, and chunks re-checked each
+# second for changes no event reports (WorldEdit, /fill, other plugins).
+chunks-per-tick: 6
+sweep-chunks-per-second: 6

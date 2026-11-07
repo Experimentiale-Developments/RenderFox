@@ -1,0 +1,113 @@
+--- a/x264.h
++++ b/x264.h
+@@ -629,6 +629,10 @@
+     struct
+     {
+         int i_x0, i_y0, i_x1, i_y1;
++        /* Only the region's slices will be used: everything outside it is neither analysed
++         * nor encoded (its slices come out empty and meaningless) and its rows are not
++         * filtered. For an encoder that recodes just the region. */
++        int b_only;
+     } region;
+ } x264_param_t;
+ 
+--- a/common/common.h
++++ b/common/common.h
+@@ -78,6 +78,7 @@
+ #endif
+ 
+ #define REGION_ACTIVE( param ) ((param)->region.i_x1 > (param)->region.i_x0 && (param)->region.i_y1 > (param)->region.i_y0)
++#define REGION_HOLDS( param, x, y ) ((x) >= (param)->region.i_x0 && (x) < (param)->region.i_x1 && (y) >= (param)->region.i_y0 && (y) < (param)->region.i_y1)
+ 
+ #ifdef CHROMA_FORMAT
+ #    define CHROMA_H_SHIFT (CHROMA_FORMAT == CHROMA_420 || CHROMA_FORMAT == CHROMA_422)
+--- a/common/frame.c
++++ b/common/frame.c
+@@ -444,6 +444,21 @@
+     {
+         int v_shift = CHROMA_V_SHIFT;
+         get_plane_ptr( h, src, &pix[0], &stride[0], 0, 0, 0 );
++        if( h->param.region.b_only && i_csp == X264_CSP_I420 )
++        {
++            /* Only the region is encoded: only its rows, and a macroblock either side, are read. */
++            int y0 = X264_MAX( 16*h->param.region.i_y0 - 16, 0 );
++            int y1 = X264_MIN( 16*h->param.region.i_y1 + 16, h->param.i_height );
++            get_plane_ptr( h, src, &pix[1], &stride[1], 1, 1, v_shift );
++            get_plane_ptr( h, src, &pix[2], &stride[2], 2, 1, v_shift );
++            h->mc.plane_copy( dst->plane[0] + y0*dst->i_stride[0], dst->i_stride[0], (pixel*)pix[0] + y0*(stride[0]/SIZEOF_PIXEL),
++                              stride[0]/SIZEOF_PIXEL, h->param.i_width, y1 - y0 );
++            h->mc.plane_copy_interleave( dst->plane[1] + (y0>>1)*dst->i_stride[1], dst->i_stride[1],
++                                         (pixel*)pix[1] + (y0>>1)*(stride[1]/SIZEOF_PIXEL), stride[1]/SIZEOF_PIXEL,
++                                         (pixel*)pix[2] + (y0>>1)*(stride[2]/SIZEOF_PIXEL), stride[2]/SIZEOF_PIXEL,
++                                         h->param.i_width>>1, (y1 - y0)>>1 );
++            return 0;
++        }
+         h->mc.plane_copy( dst->plane[0], dst->i_stride[0], (pixel*)pix[0],
+                           stride[0]/SIZEOF_PIXEL, h->param.i_width, h->param.i_height );
+         if( i_csp == X264_CSP_NV12 || i_csp == X264_CSP_NV16 )
+--- a/encoder/encoder.c
++++ b/encoder/encoder.c
+@@ -584,6 +584,11 @@
+     }
+     else
+         memset( &h->param.region, 0, sizeof(h->param.region) );
++    if( h->param.region.b_only && (h->param.i_threads > 1 || h->param.b_sliced_threads) )
++    {
++        x264_log( h, X264_LOG_WARNING, "region: b_only needs a single thread\n" );
++        h->param.i_threads = 1;
++    }
+ 
+     if( h->param.i_threads == X264_THREADS_AUTO )
+     {
+@@ -2481,6 +2486,9 @@
+         return;
+     if( min_y < h->i_threadslice_start )
+         return;
++    /* Rows the region's predictions never reach: nobody reads them. */
++    if( h->param.region.b_only && (min_y < h->param.region.i_y0 - 1 || min_y > h->param.region.i_y1) && !b_end )
++        return;
+ 
+     if( b_deblock )
+         for( int y = min_y; y < mb_y; y += (1 << SLICE_MBAFF) )
+@@ -2882,6 +2890,19 @@
+             h->mb.field[mb_xy] = MB_INTERLACED;
+         }
+ 
++        if( h->param.region.b_only && !REGION_HOLDS( &h->param, i_mb_x, i_mb_y ) )
++        {
++            /* A slice outside the region: thrown away, so not worth a macroblock's work. */
++            if( mb_xy == h->sh.i_last_mb )
++                break;
++            if( ++i_mb_x == h->mb.i_mb_width )
++            {
++                i_mb_y++;
++                i_mb_x = 0;
++            }
++            continue;
++        }
++
+         /* load cache */
+         if( SLICE_MBAFF )
+             x264_macroblock_cache_load_interlaced( h, i_mb_x, i_mb_y );
+--- a/encoder/ratecontrol.c
++++ b/encoder/ratecontrol.c
+@@ -389,6 +389,8 @@
+                     qp_adj = frame->f_qp_offset[mb_xy];
+                     qp_adj = strength * (qp_adj - avg_adj);
+                 }
++                else if( h->param.region.b_only && (mb_y < h->param.region.i_y0 - 1 || mb_y > h->param.region.i_y1) )
++                    qp_adj = 0.f; /* outside what is encoded */
+                 else
+                 {
+                     uint32_t energy = ac_energy_mb( h, mb_x, mb_y, frame );
+@@ -1603,6 +1605,10 @@
+ 
+     if( !rc->b_vbv )
+         return 0;
++    /* A region recoded at the quantiser it was first coded with keeps it on every row,
++     * whatever the rows before it cost, so its slices never depend on what is outside it. */
++    if( REGION_ACTIVE( &h->param ) && h->fenc->i_qpplus1 != X264_QP_AUTO )
++        return 0;
+ 
+     float qscale = qp2qscale( rc->qpm );
+     h->fdec->f_row_qp[y] = rc->qpm;

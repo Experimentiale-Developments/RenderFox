@@ -1,0 +1,4 @@
+# Upstream x264, cloned and patched by prepare.sh; reproducible from x264.pin and patches/.
+third_party/
+# build.sh's static library and headers.
+build/

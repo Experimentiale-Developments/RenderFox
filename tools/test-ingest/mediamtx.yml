@@ -1,0 +1,48 @@
+# YouTube dummy ingest (MediaMTX v1.21.0). Stands in for a.rtmps.youtube.com: RTMPS
+# only, TLS required, one accepted stream key under the live2 application, exactly
+# the URL shape YouTube uses. It records what arrives so validate.py can check it
+# against the ingest spec in docs/youtube-ingest.md.
+#
+# Test URL: rtmps://localhost:1936/live2/rf-dummy-key
+# (localhost, not 127.0.0.1, so the client sends SNI and checks the name, as it must
+# for YouTube.)
+logLevel: info
+readTimeout: 10s
+writeTimeout: 10s
+
+authMethod: internal
+authInternalUsers:
+  - user: any
+    ips: ["127.0.0.1", "::1"]
+    permissions:
+      - action: publish
+        path: live2/rf-dummy-key
+      - action: read
+        path: live2/rf-dummy-key
+      - action: api
+
+api: yes
+apiAddress: 127.0.0.1:9996
+metrics: no
+pprof: no
+playback: no
+
+rtsp: no
+rtmp: yes
+rtmpEncryption: strict
+rtmpAddress: 127.0.0.1:19350
+rtmpsAddress: 127.0.0.1:1936
+rtmpServerKey: dummy.key
+rtmpServerCert: dummy.crt
+hls: no
+webrtc: no
+srt: no
+moq: no
+
+paths:
+  live2/rf-dummy-key:
+    record: yes
+    recordPath: ./recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+    recordFormat: fmp4
+    recordSegmentDuration: 60s
+    recordDeleteAfter: 2h

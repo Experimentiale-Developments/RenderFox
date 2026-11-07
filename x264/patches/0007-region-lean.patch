@@ -1,0 +1,35 @@
+--- a/encoder/encoder.c
++++ b/encoder/encoder.c
+@@ -1684,6 +1684,12 @@
+           || h->param.rc.b_mb_tree
+           || h->param.analyse.i_weighted_pred );
+     h->frames.b_have_lowres |= h->param.rc.b_stat_read && h->param.rc.i_vbv_buffer_size > 0;
++    /* A region-only encoder given every frame's type and quantiser (no lookahead, no
++     * adaptive B-frames, scenecut or mb-tree) uses nothing it would estimate from
++     * half-resolution frames, so it keeps none. */
++    if( h->param.region.b_only && !h->param.rc.i_lookahead && !h->param.i_bframe_adaptive
++        && !h->param.i_scenecut_threshold && !h->param.rc.b_mb_tree )
++        h->frames.b_have_lowres = 0;
+     h->frames.b_have_sub8x8_esa = !!(h->param.analyse.inter & X264_ANALYSE_PSUB8x8);
+ 
+     h->frames.i_last_idr =
+--- a/encoder/slicetype.c
++++ b/encoder/slicetype.c
+@@ -1896,7 +1896,7 @@
+     }
+ 
+     /* calculate the frame costs ahead of time for x264_rc_analyse_slice while we still have lowres */
+-    if( h->param.rc.i_rc_method != X264_RC_CQP )
++    if( h->param.rc.i_rc_method != X264_RC_CQP && h->frames.b_have_lowres )
+     {
+         x264_mb_analysis_t a;
+         int p0, p1, b;
+@@ -1936,7 +1936,7 @@
+ 
+     /* Analyse for weighted P frames */
+     if( !h->param.rc.b_stat_read && h->lookahead->next.list[bframes]->i_type == X264_TYPE_P
+-        && h->param.analyse.i_weighted_pred >= X264_WEIGHTP_SIMPLE )
++        && h->param.analyse.i_weighted_pred >= X264_WEIGHTP_SIMPLE && h->frames.b_have_lowres )
+     {
+         x264_emms();
+         x264_weights_analyse( h, h->lookahead->next.list[bframes], h->lookahead->last_nonb, 0 );

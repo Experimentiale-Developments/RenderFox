@@ -1,0 +1,37 @@
+# Render Fox relay (MediaMTX v1.21.0) on the render box, reachable from the box only. The
+# encoder publishes here and the uplinks read from here, so a dropped connection to the
+# ingest restarts only an uplink, never the renderer (which would lose its replay
+# recording). Nothing listens on the network.
+logLevel: warn
+readTimeout: 10s
+writeTimeout: 10s
+
+authMethod: internal
+authInternalUsers:
+  - user: any
+    ips: ["127.0.0.1", "::1"]
+    permissions:
+      - action: publish
+        path: fm
+      - action: read
+        path: fm
+      - action: api
+
+api: yes
+apiAddress: 127.0.0.1:9997
+metrics: no
+pprof: no
+playback: no
+
+rtsp: no
+rtmp: yes
+rtmpEncryption: "no"
+rtmpAddress: 127.0.0.1:1935
+hls: no
+webrtc: no
+srt: no
+moq: no
+
+paths:
+  fm:
+    overridePublisher: yes

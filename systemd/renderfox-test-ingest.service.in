@@ -1,0 +1,14 @@
+[Unit]
+Description=Render Fox test ingest (testing only): a stand-in for YouTube on rtmps://localhost:1936, recording
+After=network-online.target
+
+[Service]
+User=@RF_USER@
+WorkingDirectory=@RF_HOME@/tools/test-ingest
+ExecStartPre=@RF_HOME@/tools/test-ingest/make-cert.sh
+ExecStart=@RF_HOME@/deps/mediamtx mediamtx.yml
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
